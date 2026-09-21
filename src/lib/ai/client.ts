@@ -283,10 +283,17 @@ function extractContent(payload: unknown): string | undefined {
   return undefined;
 }
 
-/** 剥掉 ``` / ```json 围栏；仍解析失败时退到「第一个 { 到最后一个 }」。 */
+/**
+ * 剥掉 ``` / ```json 围栏：从第一个开围栏到**最后一个** ``` 之间的内容（JSON 字符串里出现的 ``` 不会截断）。
+ * 没有围栏、或没有闭合围栏时原样 trim；仍解析失败由 `parseJsonLoose` 退到「第一个 { 到最后一个 }」。
+ */
 export function stripFences(text: string): string {
-  const fenced = /```(?:json|JSON)?\s*\n?([\s\S]*?)\n?\s*```/.exec(text);
-  return (fenced?.[1] ?? text).trim();
+  const opening = /```[A-Za-z]*[^\S\n]*\n?/.exec(text);
+  if (!opening) return text.trim();
+  const start = opening.index + opening[0].length;
+  const end = text.lastIndexOf('```');
+  if (end < start) return text.trim();
+  return text.slice(start, end).trim();
 }
 
 export function parseJsonLoose(text: string): unknown {

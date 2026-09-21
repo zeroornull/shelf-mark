@@ -10,9 +10,10 @@ export function defaultReviewState(): ReviewState {
   return { excluded: [], includeUncategorized: false, includeDuplicates: false };
 }
 
-/** 改某条书签的类目（`c*` 或 `uncategorized`）；未知类目 id 时原样返回。 */
+/** 改某条书签的类目（`c*` 或 `uncategorized`）；未知类目 id、或目标是有子类目的父类目（纯结构）时原样返回。 */
 export function setAssignmentCategory(proposal: Proposal, bookmarkId: string, categoryId: string): Proposal {
   if (categoryId !== UNCATEGORIZED && !proposal.categories.some((c) => c.id === categoryId)) return proposal;
+  if (categoryId !== UNCATEGORIZED && hasChildCategories(proposal, categoryId)) return proposal;
   let changed = false;
   const assignments = proposal.assignments.map((a) => {
     if (a.bookmarkId !== bookmarkId || a.categoryId === categoryId) return a;
@@ -23,15 +24,29 @@ export function setAssignmentCategory(proposal: Proposal, bookmarkId: string, ca
   return changed ? { ...proposal, assignments } : proposal;
 }
 
+/** 有子类目的类目是纯结构（§0「父类目纯结构」），不能直接放书签，也不能作为合并目标。 */
+export function hasChildCategories(proposal: Proposal, categoryId: string): boolean {
+  return proposal.categories.some((c) => c.parentId === categoryId);
+}
+
+/** 能否把别的类目合并进 `intoId`：目标必须存在且没有子类目（把 A 自己的子类目算进来会让 A→A 的子类目成立，故排除 A 的孩子）。 */
+export function canMergeInto(proposal: Proposal, fromId: string, intoId: string): boolean {
+  if (fromId === intoId) return false;
+  const into = proposal.categories.find((c) => c.id === intoId);
+  if (!into) return false;
+  return !proposal.categories.some((c) => c.parentId === intoId && c.id !== fromId);
+}
+
 /**
  * 把类目 A 合并进 B：A 的书签全部改到 B，A 的子类目挂到 B 下（B 自己有父类目时子类目提升为顶层，保证最多两层），
- * 然后删掉 A。A 或 B 不存在、或 A === B 时原样返回。
+ * 然后删掉 A。A 或 B 不存在、A === B、或 B 有子类目（纯结构，不能收书签）时原样返回。
  */
 export function mergeCategories(proposal: Proposal, fromId: string, intoId: string): Proposal {
   if (fromId === intoId) return proposal;
   const from = proposal.categories.find((c) => c.id === fromId);
   const into = proposal.categories.find((c) => c.id === intoId);
   if (!from || !into) return proposal;
+  if (!canMergeInto(proposal, fromId, intoId)) return proposal;
 
   const intoIsTopLevel = into.parentId === undefined || into.parentId === fromId;
   const categories: Category[] = [];

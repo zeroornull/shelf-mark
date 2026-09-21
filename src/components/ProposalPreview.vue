@@ -2,7 +2,7 @@
 import { computed, ref, watch } from 'vue';
 import { UNCATEGORIZED } from '@/lib/ai/taxonomy';
 import type { ReusableFolder } from '@/lib/bookmarks/tree';
-import { countByCategory } from '@/lib/jobs/review';
+import { canMergeInto, countByCategory } from '@/lib/jobs/review';
 import type { Assignment, Category, FlatBookmark, Proposal, ReviewState } from '@/lib/types';
 
 /**
@@ -111,11 +111,23 @@ const duplicateGroups = computed(() =>
   })),
 );
 
-/** 书签下拉可选：全部类目（父类目标注）+ 未分类。 */
+/** 书签下拉可选：只有叶子类目 + 未分类。有子类目的父类目是纯结构（§0），不能直接放书签。 */
 const categoryOptions = computed(() =>
   rows.value
-    .map((r) => ({ id: r.category.id, label: `${r.depth > 0 ? '　' : ''}${r.category.title}${r.hasChildren ? '（父类目）' : ''}` }))
+    .filter((r) => !r.hasChildren)
+    .map((r) => ({ id: r.category.id, label: `${r.depth > 0 ? '　' : ''}${r.category.title}` }))
     .concat([{ id: UNCATEGORIZED, label: '未分类' }]),
+);
+
+/** 合并目标：不能是自己，也不能是（除自己以外还）有子类目的父类目。 */
+const mergeTargets = computed(() =>
+  rows.value
+    .filter((r) => selectedCategory.value !== undefined && r.category.id !== selectedCategory.value.id)
+    .map((r) => ({
+      id: r.category.id,
+      label: `${r.depth > 0 ? '　' : ''}${r.category.title}`,
+      disabled: selectedCategory.value === undefined || !canMergeInto(props.proposal, selectedCategory.value.id, r.category.id),
+    })),
 );
 
 const mergeTarget = ref('');
@@ -139,6 +151,10 @@ function commitMerge(): void {
   if (!selectedCategory.value || mergeTarget.value === '') return;
   const from = selectedCategory.value.id;
   const into = mergeTarget.value;
+  if (!canMergeInto(props.proposal, from, into)) {
+    window.alert(`「${byId.value.get(into)?.title ?? into}」是父类目（纯结构），不能直接收书签；请合并进它的某个子类目。`);
+    return;
+  }
   if (window.confirm(`把「${selectedCategory.value.title}」合并进「${byId.value.get(into)?.title ?? into}」？其下书签会全部改到目标类目。`)) {
     emit('merge', from, into);
     selectedId.value = into;
@@ -243,8 +259,8 @@ const CONFIDENCE_LABEL: Record<Assignment['confidence'], string> = { high: '高'
         <div class="flex gap-1">
           <select v-model="mergeTarget" class="min-w-0 flex-1 rounded border border-gray-300 px-2 py-1" :disabled="disabled" aria-label="合并到">
             <option value="">合并到…</option>
-            <option v-for="row in rows" :key="row.category.id" :value="row.category.id" :disabled="row.category.id === selectedCategory.id">
-              {{ row.depth > 0 ? '　' : '' }}{{ row.category.title }}
+            <option v-for="target in mergeTargets" :key="target.id" :value="target.id" :disabled="target.disabled">
+              {{ target.label }}{{ target.disabled ? '（父类目，不可合并进）' : '' }}
             </option>
           </select>
           <button type="button" class="rounded border border-gray-300 px-2 py-1 hover:bg-gray-50" :disabled="disabled || mergeTarget === ''" @click="commitMerge">合并</button>

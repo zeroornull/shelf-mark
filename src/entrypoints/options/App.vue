@@ -5,6 +5,7 @@ import SeedCategoriesInput from '@/components/SeedCategoriesInput.vue';
 import { useHostPermission } from '@/composables/useHostPermission';
 import { useSettings } from '@/composables/useSettings';
 import { describeAiError, pingProvider } from '@/lib/ai/client';
+import { NOT_REQUESTABLE_HINT, isRequestableOrigin } from '@/lib/origins';
 import type { Settings } from '@/lib/types';
 
 const { settings, loaded, saving, error: saveError, hasApiKey, flush } = useSettings();
@@ -33,7 +34,8 @@ async function testConnection(): Promise<void> {
 
   const asked = await requestPermission();
   if (!asked.granted) {
-    permissionNote.value = asked.error ? `${PERMISSION_REFUSED_HINT}（${asked.error}）` : PERMISSION_REFUSED_HINT;
+    if (origin.value !== null && !isRequestableOrigin(origin.value)) permissionNote.value = NOT_REQUESTABLE_HINT;
+    else permissionNote.value = asked.error ? `${PERMISSION_REFUSED_HINT}（${asked.error}）` : PERMISSION_REFUSED_HINT;
   }
 
   // 把表单里的最新值先落盘，再用同一份值去 ping

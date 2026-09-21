@@ -75,6 +75,14 @@ describe('fence stripping', () => {
     expect(stripFences('```\n{"a":1}\n```')).toBe('{"a":1}');
     expect(stripFences('Here you go:\n```json\n{"a": 1}\n```\nDone.')).toBe('{"a": 1}');
     expect(stripFences('{"a":1}')).toBe('{"a":1}');
+  });
+
+  it('a ``` inside a JSON string value does not end the fence (closing fence = last ```)', () => {
+    const inner = '{"title":"用法：```js\\nfoo()\\n```","n":1}';
+    expect(stripFences(`\`\`\`json\n${inner}\n\`\`\``)).toBe(inner);
+    expect(JSON.parse(stripFences(`\`\`\`json\n${inner}\n\`\`\`\n`))).toEqual({ title: '用法：```js\nfoo()\n```', n: 1 });
+    // 没有闭合围栏：原样 trim，交给 parseJsonLoose 的 {…} 兜底
+    expect(stripFences('```json\n{"a":1}')).toBe('```json\n{"a":1}');
     expect(parseJsonLoose('Sure! {"a":1} hope that helps')).toEqual({ a: 1 });
   });
 
