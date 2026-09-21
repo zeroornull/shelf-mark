@@ -68,6 +68,43 @@ export async function readBookmarkTree(api: BookmarksApi): Promise<BookmarkTree>
   return buildBookmarkTree(await api.getTree());
 }
 
+/** 把 `getTree()` 的原始结果按 id 建索引（含不可见树根和 managed 节点）。 */
+export function indexRawTree(rawTree: BookmarkTreeNode[]): Map<string, BookmarkTreeNode> {
+  const index = new Map<string, BookmarkTreeNode>();
+  const visit = (node: BookmarkTreeNode) => {
+    index.set(node.id, node);
+    for (const child of node.children ?? []) visit(child);
+  };
+  for (const top of rawTree) visit(top);
+  return index;
+}
+
+/** 节点在父节点 children 中的位置：优先用 Chrome 给的 `index`，缺失时按位置计算。 */
+export function positionOf(index: Map<string, BookmarkTreeNode>, node: BookmarkTreeNode): number | undefined {
+  if (node.index !== undefined) return node.index;
+  if (node.parentId === undefined) return undefined;
+  const siblings = index.get(node.parentId)?.children ?? [];
+  const position = siblings.findIndex((sibling) => sibling.id === node.id);
+  return position >= 0 ? position : undefined;
+}
+
+/**
+ * 沿 `parentId` 向上找到节点所属的可整理根（bookmarks-bar / other / mobile）。
+ * managed 子树、孤儿节点、树根本身都返回 undefined。
+ */
+export function findRootOf(index: Map<string, BookmarkTreeNode>, id: string): BookmarkTreeNode | undefined {
+  const visited = new Set<string>();
+  let current = index.get(id);
+  while (current !== undefined && !visited.has(current.id)) {
+    visited.add(current.id);
+    if (isManagedNode(current)) return undefined;
+    if (isRootNode(current)) return current;
+    if (current.parentId === undefined) return undefined;
+    current = index.get(current.parentId);
+  }
+  return undefined;
+}
+
 /**
  * 纯函数版本：把 `getTree()` 的结果整理成 `BookmarkTree`。
  *
