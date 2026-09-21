@@ -3,10 +3,19 @@ import { computed, ref } from 'vue';
 import { browser } from 'wxt/browser';
 import BookmarkTree from '@/components/BookmarkTree.vue';
 import { useBookmarkTree } from '@/composables/useBookmarkTree';
+import { useHostPermission } from '@/composables/useHostPermission';
+import { useSettings } from '@/composables/useSettings';
 import type { RootInfo } from '@/lib/bookmarks/tree';
 
 const { tree, loading, error, reload, looseByRoot, totalBookmarks } = useBookmarkTree();
 const filter = ref('');
+
+const { settings, loaded: settingsLoaded, hasApiKey } = useSettings();
+const baseUrl = computed(() => settings.value.provider.baseUrl);
+const { origin, granted: originGranted } = useHostPermission(baseUrl);
+
+/** 未配 Key 时不能开始整理（§13 第一条）。 */
+const canOrganize = computed(() => settingsLoaded.value && hasApiKey.value);
 
 /** 只展示会产生散装书签的根；mobile 根按定义没有散装书签。 */
 const looseStats = computed(() => looseByRoot.value.filter(({ root }) => root.folderType !== 'mobile'));
@@ -41,13 +50,34 @@ function openOptions(): void {
         </button>
         <button
           type="button"
-          class="rounded bg-gray-900 px-2 py-1 text-xs text-white hover:bg-gray-700"
+          class="rounded bg-gray-900 px-2 py-1 text-xs text-white hover:bg-gray-700 disabled:cursor-not-allowed disabled:opacity-50"
+          :disabled="!canOrganize"
+          :title="canOrganize ? '' : '先在设置里填 apiKey'"
           @click="openOrganize"
         >
           开始整理
         </button>
       </div>
     </header>
+
+    <section class="border-b border-gray-200 px-3 py-2 text-xs">
+      <template v-if="!settingsLoaded">
+        <p class="text-gray-500">读取设置…</p>
+      </template>
+      <template v-else-if="!hasApiKey">
+        <p class="flex items-center justify-between gap-2 text-amber-800">
+          <span>未配置 Key，无法开始整理。</span>
+          <button type="button" class="underline hover:text-amber-950" @click="openOptions">去设置</button>
+        </p>
+      </template>
+      <template v-else>
+        <p class="flex flex-wrap items-center gap-x-2 text-gray-600">
+          <span class="truncate" :title="settings.provider.baseUrl">{{ settings.provider.model || '（未填 model）' }} @ {{ origin ?? settings.provider.baseUrl }}</span>
+          <span v-if="originGranted === true" class="text-green-700">已授权</span>
+          <span v-else-if="originGranted === false" class="text-amber-700">未授权 origin（去设置页测试连接）</span>
+        </p>
+      </template>
+    </section>
 
     <section class="border-b border-gray-200 px-3 py-2 text-xs text-gray-600">
       <p v-if="loading">正在读取书签…</p>
