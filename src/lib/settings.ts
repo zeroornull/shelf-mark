@@ -10,6 +10,7 @@ export const settingsStorage = storage.defineItem<Settings>('local:settings', {
       model: 'gpt-4o-mini',
     },
     scope: 'loose-other',
+    includeFoldered: true,
     maxDepth: 2,
     batchSize: 30,
     concurrency: 2,

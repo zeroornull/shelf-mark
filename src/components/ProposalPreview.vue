@@ -15,6 +15,7 @@ const props = defineProps<{
   bookmarks: FlatBookmark[];
   review: ReviewState;
   existingFolders?: ReusableFolder[];
+  keepStillIds?: ReadonlySet<string>;
   disabled?: boolean;
 }>();
 
@@ -308,6 +309,7 @@ const CONFIDENCE_LABEL: Record<Assignment['confidence'], string> = { high: '高'
               <p class="truncate text-xs text-gray-400">
                 {{ hostOf(row.bookmark.url) }}
                 <span v-if="row.duplicate" class="ml-1 rounded bg-gray-100 px-1 text-gray-600">重复</span>
+                <span v-if="keepStillIds?.has(row.bookmark.id)" class="ml-1 rounded bg-slate-100 px-1 text-slate-600">保持不动</span>
               </p>
             </div>
             <span class="shrink-0 rounded px-1.5 text-xs" :class="CONFIDENCE_CLASS[row.assignment.confidence]">{{ CONFIDENCE_LABEL[row.assignment.confidence] }}</span>

@@ -3,7 +3,9 @@ import { createFakeBookmarksApi, type SeedNode } from '../src/lib/bookmarks/fake
 import {
   buildBookmarkTree,
   countLooseByRoot,
+  countSelectedByRoot,
   isLoose,
+  listEmptiedUserFolders,
   listLooseBookmarks,
   listReusableFolders,
   readBookmarkTree,
@@ -210,22 +212,101 @@ describe('listReusableFolders', () => {
 });
 
 describe('selectBookmarksInScope', () => {
-  it("'loose-other' selects loose bookmarks of every other-root only", async () => {
+  it("'loose-other' + includeFoldered false selects only loose bookmarks of every other-root", async () => {
     const tree = await readBookmarkTree(createFakeBookmarksApi(seed));
-    expect(selectBookmarksInScope(tree, 'loose-other').map((b) => b.id)).toEqual(['o1', 'o2', 'o3']);
+    expect(selectBookmarksInScope(tree, 'loose-other', undefined, false).map((b) => b.id)).toEqual(['o1', 'o2', 'o3']);
   });
 
-  it("'loose-bar-and-other' also includes the bookmarks bar, but never mobile or folders", async () => {
+  it("'loose-bar-and-other' + includeFoldered false includes the bar, but never mobile or foldered", async () => {
     const tree = await readBookmarkTree(createFakeBookmarksApi(seed));
-    expect(selectBookmarksInScope(tree, 'loose-bar-and-other').map((b) => b.id)).toEqual(['b1', 'b2', 'o1', 'o2', 'o3']);
+    expect(selectBookmarksInScope(tree, 'loose-bar-and-other', undefined, false).map((b) => b.id)).toEqual(['b1', 'b2', 'o1', 'o2', 'o3']);
   });
 
-  it('applies debugLimit to the selection, ignoring 0 / undefined', async () => {
+  it('includeFoldered true (default) includes nested bookmarks under scope roots, keeps folderPath / rootId', async () => {
     const tree = await readBookmarkTree(createFakeBookmarksApi(seed));
-    expect(selectBookmarksInScope(tree, 'loose-bar-and-other', 2).map((b) => b.id)).toEqual(['b1', 'b2']);
-    expect(selectBookmarksInScope(tree, 'loose-other', 1).map((b) => b.id)).toEqual(['o1']);
-    expect(selectBookmarksInScope(tree, 'loose-other', 0)).toHaveLength(3);
-    expect(selectBookmarksInScope(tree, 'loose-other', undefined)).toHaveLength(3);
-    expect(selectBookmarksInScope(tree, 'loose-other', 99)).toHaveLength(3);
+    const other = selectBookmarksInScope(tree, 'loose-other');
+    expect(other.map((b) => b.id)).toEqual(['o1', 'l1', 'o2', 'o3']);
+    expect(other.find((b) => b.id === 'l1')).toMatchObject({ rootId: '902', parentId: 'f-life', folderPath: ['生活'] });
+
+    const both = selectBookmarksInScope(tree, 'loose-bar-and-other');
+    expect(both.map((b) => b.id)).toEqual(['b1', 'w1', 'fe1', 'b2', 'i1', 'o1', 'l1', 'o2', 'o3']);
+    expect(both.find((b) => b.id === 'fe1')).toMatchObject({ rootId: '901', parentId: 'f-fe', folderPath: ['工作', '前端'] });
+    expect(both.map((b) => b.id)).not.toContain('m1');
+    expect(both.map((b) => b.id)).not.toContain('mg1');
+    expect(both.map((b) => b.id)).not.toContain('mg2');
+  });
+
+  it('never crosses roots and still excludes managed nested inside a normal root', () => {
+    const tree = buildBookmarkTree([
+      {
+        id: '0',
+        title: '',
+        children: [
+          {
+            id: '1',
+            title: 'bar',
+            folderType: 'bookmarks-bar',
+            children: [
+              { id: 'm', title: 'policy', unmodifiable: 'managed', children: [{ id: 'mb', title: 'x', url: 'https://x' }] },
+              { id: 'ok', title: 'ok', url: 'https://ok' },
+              { id: 'f', title: '工作', children: [{ id: 'w', title: 'w', url: 'https://w' }] },
+            ],
+          },
+        ],
+      },
+    ]);
+    expect(selectBookmarksInScope(tree, 'loose-bar-and-other').map((b) => b.id)).toEqual(['ok', 'w']);
+    expect(selectBookmarksInScope(tree, 'loose-other')).toEqual([]);
+  });
+
+  it('applies debugLimit after inclusion, ignoring 0 / undefined', async () => {
+    const tree = await readBookmarkTree(createFakeBookmarksApi(seed));
+    expect(selectBookmarksInScope(tree, 'loose-bar-and-other', 2, false).map((b) => b.id)).toEqual(['b1', 'b2']);
+    expect(selectBookmarksInScope(tree, 'loose-other', 1, false).map((b) => b.id)).toEqual(['o1']);
+    expect(selectBookmarksInScope(tree, 'loose-other', 0, false)).toHaveLength(3);
+    expect(selectBookmarksInScope(tree, 'loose-other', undefined, false)).toHaveLength(3);
+    expect(selectBookmarksInScope(tree, 'loose-other', 99, false)).toHaveLength(3);
+    // includeFoldered 之后再截：DFS 顺序 b1, w1, fe1… 而不是先截散装
+    expect(selectBookmarksInScope(tree, 'loose-bar-and-other', 2, true).map((b) => b.id)).toEqual(['b1', 'w1']);
+    expect(selectBookmarksInScope(tree, 'loose-other', 2, true).map((b) => b.id)).toEqual(['o1', 'l1']);
+  });
+
+  it('countSelectedByRoot splits loose vs foldered per root', async () => {
+    const tree = await readBookmarkTree(createFakeBookmarksApi(seed));
+    const selected = selectBookmarksInScope(tree, 'loose-bar-and-other', undefined, true);
+    expect(countSelectedByRoot(tree, selected).map(({ root, total, loose, foldered }) => [root.id, total, loose, foldered])).toEqual([
+      ['901', 5, 2, 3],
+      ['902', 4, 3, 1],
+      ['903', 0, 0, 0],
+    ]);
+    const looseOnly = selectBookmarksInScope(tree, 'loose-other', undefined, false);
+    expect(countSelectedByRoot(tree, looseOnly).map(({ root, total, loose, foldered }) => [root.folderType, total, loose, foldered])).toEqual([
+      ['bookmarks-bar', 0, 0, 0],
+      ['other', 3, 3, 0],
+      ['mobile', 0, 0, 0],
+    ]);
+  });
+
+  it('listEmptiedUserFolders reports empty non-root, non-created folders only', async () => {
+    const tree = await readBookmarkTree(createFakeBookmarksApi(seed));
+    const emptied = listEmptiedUserFolders(tree, ['f-work', 'f-fe', '901', 'created-new'], new Set(['created-new']));
+    // f-work / f-fe 还有书签；根和本次新建的都排除
+    expect(emptied).toEqual([]);
+
+    const emptyTree = buildBookmarkTree([
+      {
+        id: '0',
+        title: '',
+        children: [
+          {
+            id: '2',
+            title: 'other',
+            folderType: 'other',
+            children: [{ id: 'old', title: '旧分类', children: [] }],
+          },
+        ],
+      },
+    ]);
+    expect(listEmptiedUserFolders(emptyTree, ['old', '2', 'brand-new'], new Set(['brand-new']))).toEqual([{ id: 'old', path: ['旧分类'] }]);
   });
 });

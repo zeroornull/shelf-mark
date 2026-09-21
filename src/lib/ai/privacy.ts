@@ -4,6 +4,7 @@
 
 export const MAX_URL_LENGTH = 120;
 export const MAX_TITLE_LENGTH = 120;
+export const MAX_FOLDER_HINT_LENGTH = 80;
 const MAX_PATH_SEGMENTS = 3;
 
 /**
@@ -36,6 +37,13 @@ const EMAIL_RE = /[\w.+-]+@[\w-]+(?:\.[\w-]+)+/g;
 export function redactTitle(title: string): string {
   const redacted = title.replace(EMAIL_RE, '[email]').replace(/\s+/g, ' ').trim();
   return truncate(redacted, MAX_TITLE_LENGTH);
+}
+
+/** 各段标题按 title 脱敏后用 `/` 拼接，总长 ≤ 80；空路径返回 undefined。 */
+export function redactFolderHint(folderPath: readonly string[] | undefined): string | undefined {
+  if (!folderPath || folderPath.length === 0) return undefined;
+  const joined = folderPath.map((title) => redactTitle(title)).join('/');
+  return truncate(joined, MAX_FOLDER_HINT_LENGTH);
 }
 
 function truncate(text: string, max: number): string {

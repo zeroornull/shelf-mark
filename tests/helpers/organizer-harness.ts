@@ -15,6 +15,7 @@ export const API_KEY = 'sk-test-key-abcdef1234567890';
 export const settings = (overrides: Partial<Settings> = {}): Settings => ({
   provider: { baseUrl: 'https://api.example.com/v1', apiKey: API_KEY, model: 'm' },
   scope: 'loose-other',
+  includeFoldered: false,
   maxDepth: 2,
   batchSize: 10,
   concurrency: 2,

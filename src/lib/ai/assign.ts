@@ -1,6 +1,6 @@
 import type { Assignment, Category, FlatBookmark } from '../types';
 import { AiError, type ChatFn } from './client';
-import { redactTitle, sanitizeUrl } from './privacy';
+import { redactFolderHint, redactTitle, sanitizeUrl } from './privacy';
 import { ASSIGN_SYSTEM, buildAssignUser, type AssignCategory } from './prompts';
 import { assignSchema } from './schema';
 import { UNCATEGORIZED, categoryPath, indexCategories } from './taxonomy';
@@ -18,7 +18,7 @@ import { UNCATEGORIZED, categoryPath, indexCategories } from './taxonomy';
 export type AssignWarnings = { unknownCategory: number; missingIndex: number };
 
 export type AssignInput = {
-  bookmarks: ReadonlyArray<Pick<FlatBookmark, 'id' | 'title' | 'url'>>;
+  bookmarks: ReadonlyArray<Pick<FlatBookmark, 'id' | 'title' | 'url'> & { folderPath?: string[] }>;
   /** 可分配的类目（maxDepth=2 时只传叶子）。 */
   categories: Category[];
   /** 全部类目，用来拼 path（父类目标题）；默认与 `categories` 相同。 */
@@ -77,7 +77,12 @@ export async function assignBookmarks(input: AssignInput, deps: AssignDeps): Pro
     const batch = batches[index]!;
     const user = buildAssignUser({
       categories: categoriesPayload,
-      bookmarks: batch.map((b, i) => ({ i, title: redactTitle(b.title), url: sanitizeUrl(b.url, input.domainOnly) })),
+      bookmarks: batch.map((b, i) => {
+        const folder = redactFolderHint(b.folderPath);
+        return folder === undefined
+          ? { i, title: redactTitle(b.title), url: sanitizeUrl(b.url, input.domainOnly) }
+          : { i, title: redactTitle(b.title), url: sanitizeUrl(b.url, input.domainOnly), folder };
+      }),
     });
     console.debug('[shelfmark] assign batch', index + 1, '/', batches.length, `(${batch.length} bookmarks)`);
     const raw = await deps.chat({ system: ASSIGN_SYSTEM, user, schema: assignSchema, signal: controller.signal });

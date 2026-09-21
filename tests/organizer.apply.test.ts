@@ -681,3 +681,68 @@ describe('restore() and apply-related persistence (M6)', () => {
     expect(second.organizer.plannedMoves()).toHaveLength(30);
   });
 });
+
+describe('includeFoldered: restore origins, keep-still, emptied folders', () => {
+  it('restore skips a loose-origin bookmark whose parent changed after persist', async () => {
+    const first = harness(4);
+    await reviewed(first);
+    await first.organizer.flush();
+    const saved = structuredClone(first.persisted[first.persisted.length - 1]!);
+    expect(saved.origins?.['bm-tb-2']).toEqual({ parentId: '2', rootId: '2' });
+
+    const second = harness(4);
+    await second.api.move('bm-tb-2', { parentId: 'other-work' });
+    expect(await second.organizer.restore(saved)).toBe(true);
+    expect(second.organizer.state.bookmarks.map((b) => b.id)).not.toContain('bm-tb-2');
+    expect(second.organizer.state.job.skipped).toContainEqual({ bookmarkId: 'bm-tb-2', reason: 'parent-changed' });
+    expect(second.organizer.plannedMoves().map((m) => m.bookmarkId)).not.toContain('bm-tb-2');
+  });
+
+  it('restore skips a foldered-origin bookmark whose parent changed after persist', async () => {
+    const first = harness(4, { settings: settings({ includeFoldered: true }) });
+    await first.organizer.start();
+    await first.organizer.flush();
+    const saved = structuredClone(first.persisted[first.persisted.length - 1]!);
+    expect(saved.origins?.['bm-in-work']).toEqual({ parentId: 'other-work', rootId: '2' });
+    expect(first.organizer.state.bookmarks.map((b) => b.id)).toContain('bm-in-work');
+
+    const second = harness(4, { settings: settings({ includeFoldered: true }) });
+    await second.api.move('bm-in-work', { parentId: '2' });
+    expect(await second.organizer.restore(saved)).toBe(true);
+    expect(second.organizer.state.bookmarks.map((b) => b.id)).not.toContain('bm-in-work');
+    expect(second.organizer.state.job.skipped).toContainEqual({ bookmarkId: 'bm-in-work', reason: 'parent-changed' });
+    expect(second.organizer.state.job.proposal!.assignments.some((a) => a.bookmarkId === 'bm-in-work')).toBe(false);
+  });
+
+  it('already-in-reused-target is planned as keep-still and is not moved', async () => {
+    const h = harness(4, { settings: settings({ includeFoldered: true }) });
+    await h.api.move('bm-gh-0', { parentId: 'other-work' });
+    await h.organizer.start();
+    const keep = h.organizer.plannedMoves().find((m) => m.bookmarkId === 'bm-gh-0');
+    expect(keep).toEqual({ bookmarkId: 'bm-gh-0', toParentId: 'other-work', expectedParentId: 'other-work' });
+
+    await h.organizer.apply();
+    expect(h.organizer.state.job.phase).toBe('done');
+    expect(h.api.getNode('bm-gh-0')?.parentId).toBe('other-work');
+    expect(h.organizer.state.job.skipped).toContainEqual({ bookmarkId: 'bm-gh-0', reason: 'same-parent' });
+    expect(h.currentSnapshot()!.items.map((i) => i.bookmarkId)).not.toContain('bm-gh-0');
+    expect(h.currentSnapshot()!.applied).not.toContain('bm-gh-0');
+  });
+
+  it('reports pre-existing folders emptied by apply and never deletes them', async () => {
+    const h = harness(4, { settings: settings({ includeFoldered: true }) });
+    const old = await h.api.create({ parentId: '2', title: '旧分类' });
+    await h.api.move('bm-tb-0', { parentId: old.id });
+    await h.organizer.start();
+    expect(h.organizer.state.job.origins?.[old.id]).toBeUndefined();
+    expect(h.organizer.state.job.origins?.['bm-tb-0']).toEqual({ parentId: old.id, rootId: '2' });
+
+    const removesBefore = h.api.calls.remove;
+    await h.organizer.apply();
+    expect(h.organizer.state.job.phase).toBe('done');
+    expect(h.api.getNode(old.id)).toBeDefined();
+    expect(h.api.getChildrenIds(old.id)).toEqual([]);
+    expect(h.api.calls.remove).toBe(removesBefore);
+    expect(h.organizer.state.job.emptiedFolders).toEqual([{ id: old.id, path: ['旧分类'] }]);
+  });
+});

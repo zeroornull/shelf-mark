@@ -19,6 +19,7 @@ export function useSettings(options: { debounceMs?: number } = {}) {
 
   function applyRemote(value: Settings | null): void {
     const next = value ?? structuredClone(settingsStorage.fallback);
+    if (next.includeFoldered === undefined) next.includeFoldered = true;
     const json = JSON.stringify(next);
     if (json === lastSynced) return;
     lastSynced = json;

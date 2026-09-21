@@ -18,7 +18,7 @@ const bookmarks = (n: number) =>
     url: `https://site${i % 4}.com/path/a/b/c/d?q=${i}#frag`,
   }));
 
-type Payload = { categories: Array<{ id: string; title: string; path: string[] }>; bookmarks: Array<{ i: number; title: string; url: string }> };
+type Payload = { categories: Array<{ id: string; title: string; path: string[] }>; bookmarks: Array<{ i: number; title: string; url: string; folder?: string }> };
 
 /** 每批把所有 i 交替分到 c2 / c3；记录 payload。 */
 function echoChat(record: Payload[] = []): ChatFn {
@@ -77,6 +77,32 @@ describe('assignBookmarks – batching and payload', () => {
     expect(result.assignments[10]).toEqual({ bookmarkId: 'real-bm-10', categoryId: 'c2', confidence: 'high' });
     expect(result.assignments[11]?.categoryId).toBe('c3');
     expect(result.warnings).toEqual({ unknownCategory: 0, missingIndex: 0 });
+  });
+
+  it('adds folder hint iff folderPath is nonempty; each title is redacted and total length ≤ 80', async () => {
+    const record: Payload[] = [];
+    await assignBookmarks(
+      {
+        bookmarks: [
+          { id: 'real-loose', title: 'Loose', url: 'https://a.com/x', folderPath: [] },
+          { id: 'real-nested', title: 'Nested owner@example.com', url: 'https://b.com/x', folderPath: ['工作', '前端'] },
+          { id: 'real-email-folder', title: 'In mail', url: 'https://c.com/x', folderPath: ['Inbox owner@x.com', 'A'.repeat(100)] },
+        ],
+        categories: leaves,
+        batchSize: 30,
+        concurrency: 1,
+        domainOnly: false,
+      },
+      { chat: echoChat(record) },
+    );
+    expect(record[0]?.bookmarks[0]).toEqual({ i: 0, title: 'Loose', url: 'https://a.com/x' });
+    expect(record[0]?.bookmarks[0]).not.toHaveProperty('folder');
+    expect(record[0]?.bookmarks[1]).toEqual({ i: 1, title: 'Nested [email]', url: 'https://b.com/x', folder: '工作/前端' });
+    expect(record[0]?.bookmarks[2]?.folder).toBe(`Inbox [email]/${'A'.repeat(100)}`.slice(0, 80));
+    expect(record[0]?.bookmarks[2]?.folder?.length).toBeLessThanOrEqual(80);
+    const body = JSON.stringify(record[0]);
+    expect(body).not.toContain('real-');
+    expect(body).not.toContain('owner@example.com');
   });
 
   it('domainOnly sends hostnames only', async () => {

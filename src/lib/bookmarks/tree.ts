@@ -44,6 +44,13 @@ export type BookmarkTree = {
 
 export type Scope = Settings['scope'];
 
+export type ScopeRootCount = {
+  root: RootInfo;
+  total: number;
+  loose: number;
+  foldered: number;
+};
+
 const ROOT_TYPES: ReadonlySet<string> = new Set<RootFolderType>(['bookmarks-bar', 'other', 'mobile']);
 const LOOSE_ROOT_TYPES: ReadonlySet<RootFolderType> = new Set<RootFolderType>(['bookmarks-bar', 'other']);
 
@@ -223,13 +230,16 @@ export function listReusableFolders(tree: BookmarkTree, rootId: string): Reusabl
 }
 
 /**
- * 按 settings.scope 选出待整理的书签；`debugLimit` 有值（> 0）时只取前 N 条。
- * 两棵同类型的账号 / 本地树都会被选中，但各自保留自己的 `rootId`。
+ * 按 settings.scope 选出待整理的书签。
+ * `includeFoldered` 为 true（默认）时包含范围内各根下任意深度的书签；为 false 时只取根下散装。
+ * managed 子树在建树时已剔除；不跨根。`debugLimit` 有值（> 0）时在入选之后再截前 N 条。
+ * 两棵同类型的账号 / 本地树都会被选中，但各自保留自己的 `rootId` / `folderPath`。
  */
 export function selectBookmarksInScope(
   tree: BookmarkTree,
   scope: Scope,
   debugLimit?: number,
+  includeFoldered = true,
 ): FlatBookmark[] {
   const allowed: ReadonlySet<RootFolderType> =
     scope === 'loose-bar-and-other'
@@ -238,13 +248,63 @@ export function selectBookmarksInScope(
   const roots = rootById(tree);
 
   const selected = tree.bookmarks.filter((bookmark) => {
-    if (bookmark.parentId !== bookmark.rootId) return false;
     const root = roots.get(bookmark.rootId);
-    return root !== undefined && allowed.has(root.folderType);
+    if (root === undefined || !allowed.has(root.folderType)) return false;
+    if (!includeFoldered && bookmark.parentId !== bookmark.rootId) return false;
+    return true;
   });
 
   if (debugLimit !== undefined && Number.isFinite(debugLimit) && debugLimit > 0) {
     return selected.slice(0, Math.floor(debugLimit));
   }
   return selected;
+}
+
+/** 已选书签按根统计：总数 / 散装 / 文件夹内（`debugLimit` 截过之后再数）。 */
+export function countSelectedByRoot(tree: BookmarkTree, selected: ReadonlyArray<FlatBookmark>): ScopeRootCount[] {
+  const totals = new Map<string, { total: number; loose: number }>(tree.roots.map((root) => [root.id, { total: 0, loose: 0 }]));
+  for (const bookmark of selected) {
+    const slot = totals.get(bookmark.rootId) ?? { total: 0, loose: 0 };
+    slot.total += 1;
+    if (isLoose(bookmark, tree)) slot.loose += 1;
+    totals.set(bookmark.rootId, slot);
+  }
+  return tree.roots.map((root) => {
+    const slot = totals.get(root.id) ?? { total: 0, loose: 0 };
+    return { root, total: slot.total, loose: slot.loose, foldered: slot.total - slot.loose };
+  });
+}
+
+/**
+ * 应用后变空的、用户原来就有的文件夹。排除根节点和本次新建的文件夹；只报告，调用方不得删除。
+ */
+export function listEmptiedUserFolders(
+  tree: BookmarkTree,
+  fromParentIds: ReadonlyArray<string>,
+  createdFolderIds: ReadonlySet<string>,
+): Array<{ id: string; path: string[] }> {
+  const rootIds = new Set(tree.roots.map((root) => root.id));
+  const folders = indexFolders(tree);
+  const seen = new Set<string>();
+  const out: Array<{ id: string; path: string[] }> = [];
+  for (const id of fromParentIds) {
+    if (seen.has(id) || rootIds.has(id) || createdFolderIds.has(id)) continue;
+    seen.add(id);
+    const folder = folders.get(id);
+    if (!folder || folder.node.children.length > 0) continue;
+    out.push({ id, path: folder.path });
+  }
+  return out;
+}
+
+function indexFolders(tree: BookmarkTree): Map<string, { node: FolderNode; path: string[] }> {
+  const out = new Map<string, { node: FolderNode; path: string[] }>();
+  const walk = (folder: FolderNode, path: string[]) => {
+    out.set(folder.id, { node: folder, path });
+    for (const child of folder.children) {
+      if (isFolderNode(child)) walk(child, [...path, child.title]);
+    }
+  };
+  for (const node of tree.nodes) walk(node, []);
+  return out;
 }

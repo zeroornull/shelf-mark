@@ -23,6 +23,7 @@ export const REFINE_SYSTEM = `已有类目列表如下，但仍有一批书签�
 export const ASSIGN_SYSTEM = `你把书签分到已给定的类目中。
 规则：
 - 只依据 title 和 url
+- folder 是书签当前所在文件夹，仅供参考；如果它已经合理，优先分到复用该文件夹的类目
 - categoryId 只能是给定列表中的 id（如 "c3"）或 "uncategorized"
 - 只返回 { "items": [{ "i", "categoryId", "confidence" }] }
 - items 必须覆盖输入的每一个 i
@@ -66,7 +67,7 @@ export function buildRefineUser(payload: RefinePayload): string {
 }
 
 export type AssignCategory = { id: string; title: string; path: string[] };
-export type AssignBookmark = { i: number; title: string; url: string };
+export type AssignBookmark = { i: number; title: string; url: string; folder?: string };
 
 export type AssignPayload = {
   categories: AssignCategory[];

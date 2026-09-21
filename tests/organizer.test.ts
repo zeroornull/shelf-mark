@@ -40,6 +40,9 @@ describe('Organizer – happy path', () => {
     expect(job.proposal?.duplicates).toEqual([{ url: 'https://github.com/dup/repo', bookmarkIds: ['bm-dup-1', 'bm-dup-2'] }]);
     expect(job.proposal?.warnings).toEqual({ unknownCategory: 0, missingIndex: 0 });
     expect(job.review).toEqual({ excluded: [], includeUncategorized: false, includeDuplicates: false });
+    expect(job.input?.includeFoldered).toBe(false);
+    expect(job.origins?.['bm-gh-0']).toEqual({ parentId: '2', rootId: '2' });
+    expect(Object.keys(job.origins ?? {})).toHaveLength(36);
 
     // 4 个杂项 / 36 = 11%，且 < 10 条 → 不 refine
     expect(record.filter((r) => r.system === REFINE_SYSTEM)).toHaveLength(0);
@@ -75,7 +78,7 @@ describe('Organizer – happy path', () => {
     const organizer = new Organizer({ bookmarksApi: api, chat: scriptedChat(), persistJob: async () => {}, persistSnapshot: async () => {}, settings: settings() });
     await organizer.start();
     expect(organizer.state.job.phase).toBe('error');
-    expect(organizer.state.job.error).toContain('没有散装书签');
+    expect(organizer.state.job.error).toContain('没有书签');
   });
 });
 

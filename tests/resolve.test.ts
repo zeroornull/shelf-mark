@@ -65,4 +65,26 @@ describe('resolveMoves', () => {
     expect(out.map((m) => m.bookmarkId)).not.toContain('o-react');
     expect(out).toHaveLength(4);
   });
+
+  it('takes expectedParentId from persisted origins, not the live parentId', () => {
+    const foldered = [{ id: 'o-fe', rootId: '2', parentId: 'fFe' }];
+    const out = resolveMoves({
+      proposal: proposal(),
+      review,
+      bookmarks: foldered,
+      folderRoot,
+      origins: { 'o-fe': { parentId: 'fFe' } },
+    });
+    expect(out).toEqual([{ bookmarkId: 'o-fe', toParentId: 'fFe', expectedParentId: 'fFe' }]);
+
+    const moved = [{ id: 'o-fe', rootId: '2', parentId: '2' }];
+    const fromOrigin = resolveMoves({
+      proposal: proposal(),
+      review,
+      bookmarks: moved,
+      folderRoot,
+      origins: { 'o-fe': { parentId: 'old-parent' } },
+    });
+    expect(fromOrigin[0]).toMatchObject({ bookmarkId: 'o-fe', expectedParentId: 'old-parent' });
+  });
 });

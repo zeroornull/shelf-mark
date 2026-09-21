@@ -7,10 +7,10 @@ import { useBookmarkTree } from '@/composables/useBookmarkTree';
 import { useHostPermission } from '@/composables/useHostPermission';
 import { focusOrOpenOrganizePage } from '@/composables/useOrganizeTab';
 import { useSettings } from '@/composables/useSettings';
-import type { RootInfo } from '@/lib/bookmarks/tree';
+import { countSelectedByRoot, selectBookmarksInScope, type RootInfo } from '@/lib/bookmarks/tree';
 
 // live：书签有任何变化（整理页 apply / 撤销、用户手动改）都会防抖刷新树
-const { tree, loading, error, reload, looseByRoot, totalBookmarks } = useBookmarkTree({ live: true });
+const { tree, loading, error, reload, totalBookmarks } = useBookmarkTree({ live: true });
 const filter = ref('');
 
 const { settings, loaded: settingsLoaded, hasApiKey } = useSettings();
@@ -20,8 +20,13 @@ const { origin, granted: originGranted } = useHostPermission(baseUrl);
 /** 未配 Key 时不能开始整理（§13 第一条）。 */
 const canOrganize = computed(() => settingsLoaded.value && hasApiKey.value);
 
-/** 只展示会产生散装书签的根；mobile 根按定义没有散装书签。 */
-const looseStats = computed(() => looseByRoot.value.filter(({ root }) => root.folderType !== 'mobile'));
+/** 按当前整理范围统计各根：总数 / 散装 / 文件夹内。mobile 不进范围。 */
+const scopeStats = computed(() => {
+  if (!tree.value || !settingsLoaded.value) return [];
+  const selected = selectBookmarksInScope(tree.value, settings.value.scope, settings.value.debugLimit, settings.value.includeFoldered ?? true);
+  const allowed = settings.value.scope === 'loose-bar-and-other' ? ['bookmarks-bar', 'other'] : ['other'];
+  return countSelectedByRoot(tree.value, selected).filter(({ root }) => allowed.includes(root.folderType));
+});
 
 /** 同一 folderType 有账号 / 本地两棵树时，用 syncing 区分显示。 */
 function rootLabel(root: RootInfo): string {
@@ -91,8 +96,8 @@ function openOptions(): void {
       <template v-else>
         <p>共 {{ totalBookmarks }} 条书签</p>
         <ul class="mt-1 space-y-0.5">
-          <li v-for="{ root, count } in looseStats" :key="root.id">
-            {{ rootLabel(root) }}：<span class="font-medium text-gray-800">{{ count }}</span> 条散装书签
+          <li v-for="{ root, total, loose, foldered } in scopeStats" :key="root.id">
+            {{ rootLabel(root) }}：共 <span class="font-medium text-gray-800">{{ total }}</span> 条（散装 {{ loose }}，文件夹内 {{ foldered }}）
           </li>
         </ul>
       </template>

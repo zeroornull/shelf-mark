@@ -141,9 +141,18 @@ function setLanguage(value: string): void {
       <div class="grid grid-cols-[8rem_1fr] items-center gap-x-2 gap-y-3">
         <label class="text-gray-600" for="scope">整理范围</label>
         <select id="scope" class="rounded border border-gray-300 px-2 py-1" :value="settings.scope" @change="setScope(($event.target as HTMLSelectElement).value)">
-          <option value="loose-other">只整理「其他书签」里的散装书签</option>
-          <option value="loose-bar-and-other">「其他书签」+ 书签栏上未进文件夹的书签</option>
+          <option value="loose-other">只整理「其他书签」</option>
+          <option value="loose-bar-and-other">「其他书签」+ 书签栏</option>
         </select>
+
+        <span class="text-gray-600">已有文件夹</span>
+        <div class="space-y-1">
+          <label class="flex items-center gap-2">
+            <input v-model="settings.includeFoldered" type="checkbox" />
+            <span>包含已在文件夹中的书签</span>
+          </label>
+          <p class="text-xs text-gray-500">关闭时只整理根目录下的散装书签</p>
+        </div>
 
         <label class="text-gray-600" for="max-depth">文件夹层数</label>
         <select id="max-depth" class="rounded border border-gray-300 px-2 py-1" :value="settings.maxDepth" @change="setMaxDepth(($event.target as HTMLSelectElement).value)">

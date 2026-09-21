@@ -6,6 +6,7 @@ import type { BookmarksApi, BookmarkTreeNode } from '../bookmarks/api';
 import { describeBookmarkError } from '../bookmarks/errors';
 import { ApplySnapshotError, applySnapshot, type ApplyResult, type PlannedMove } from '../bookmarks/snapshot';
 import {
+  listEmptiedUserFolders,
   listReusableFolders,
   readBookmarkTree,
   selectBookmarksInScope,
@@ -13,7 +14,7 @@ import {
   type ReusableFolder,
   type RootInfo,
 } from '../bookmarks/tree';
-import type { FlatBookmark, JobInput, OrganizeJob, Proposal, RestoreSummary, ReviewState, Settings, Snapshot } from '../types';
+import type { BookmarkOrigin, FlatBookmark, JobInput, OrganizeJob, Proposal, RestoreSummary, ReviewState, Settings, Snapshot } from '../types';
 import { rollbackInterruptedSnapshot, summarizeRestore, undoSnapshot } from './recovery';
 import { resolveMoves } from './resolve';
 import * as review from './review';
@@ -122,9 +123,11 @@ export class Organizer {
   async start(input: Partial<JobInput> = {}): Promise<void> {
     if (this.isRunning) throw new Error('Organizer is already running.');
     const settings = this.settings();
+    const includeFoldered = input.includeFoldered ?? settings.includeFoldered ?? true;
     const jobInput: JobInput = {
       seedCategories: input.seedCategories ?? settings.seedCategories,
       userHint: input.userHint ?? settings.userHint,
+      includeFoldered,
     };
     this.job = { ...createIdleJob(this.newId()), input: jobInput };
     this.bookmarks = [];
@@ -141,10 +144,11 @@ export class Organizer {
       const tree = await readBookmarkTree(this.deps.bookmarksApi);
       this.checkpoint(token, signal);
       this.tree = tree;
-      this.bookmarks = selectBookmarksInScope(tree, settings.scope, settings.debugLimit);
+      this.bookmarks = selectBookmarksInScope(tree, settings.scope, settings.debugLimit, includeFoldered);
       this.existingFolders = this.scopeRoots(tree, settings).flatMap((root) => listReusableFolders(tree, root.id));
+      this.job = { ...this.job, origins: originsFrom(this.bookmarks) };
       if (this.bookmarks.length === 0) {
-        throw new Error('整理范围内没有散装书签');
+        throw new Error('整理范围内没有书签');
       }
       await this.generate(token, signal, settings, jobInput);
     });
@@ -153,7 +157,11 @@ export class Organizer {
   /** 「带提示重新生成」：沿用当前范围的书签，回到 proposing。 */
   async regenerate(userHint: string): Promise<void> {
     if (this.isRunning) throw new Error('Organizer is already running.');
-    const input: JobInput = { seedCategories: this.job.input?.seedCategories ?? this.settings().seedCategories, userHint };
+    const input: JobInput = {
+      seedCategories: this.job.input?.seedCategories ?? this.settings().seedCategories,
+      userHint,
+      includeFoldered: this.job.input?.includeFoldered ?? this.settings().includeFoldered ?? true,
+    };
     if (this.bookmarks.length === 0 || this.tree === null) {
       await this.start(input);
       return;
@@ -196,8 +204,9 @@ export class Organizer {
 
   /**
    * 页面加载时恢复持久化的 job。review / done / error 原样恢复（有 proposal 时重新读树 join 出书签，
-   * 不重打模型；review 只保留仍是散装的书签，其余记入 skipped）；生成阶段的 job 没法续跑，丢弃并清掉存储；
-   * `applying` 的 job 不恢复也不清（可能是另一个页面正在写，被中断的情况由 snapshot 横幅处理）。返回是否恢复了一个 job。
+   * 不重打模型；review 只保留 parentId 仍等于制定计划时 origins 的书签，其余记入 skipped）；
+   * 生成阶段的 job 没法续跑，丢弃并清掉存储；`applying` 的 job 不恢复也不清（可能是另一个页面正在写，
+   * 被中断的情况由 snapshot 横幅处理）。返回是否恢复了一个 job。
    */
   async restore(saved: OrganizeJob | null): Promise<boolean> {
     if (!saved || saved.phase === 'idle') return false;
@@ -225,11 +234,18 @@ export class Organizer {
           dropped.push({ bookmarkId: assignment.bookmarkId, reason: 'missing' });
           continue;
         }
-        // review：只保留仍是散装（直接挂在范围内的根下）的书签。用户在预览和刷新之间自己归档的，
-        // 不能因为重新读树而把「parentId 未变」校验对齐到新位置（§5.3 第 1 步说的是跳过）
-        if (saved.phase === 'review' && !(bookmark.parentId === bookmark.rootId && scopeRootIds.has(bookmark.rootId))) {
-          dropped.push({ bookmarkId: bookmark.id, reason: 'parent-changed' });
-          continue;
+        // review：只保留「还在制定计划时的父文件夹」且根仍在范围内的书签。
+        // 不能用「仍是散装」——范围内本来就可以有文件夹里的书签；用户中途挪走过的必须跳过。
+        if (saved.phase === 'review') {
+          const origin = saved.origins?.[bookmark.id];
+          // 有 origins（新 job）：parentId 必须仍是制定计划时的值。没有 origins 的旧 job 仍按「还在范围内的根下」判断。
+          const parentOk = saved.origins
+            ? origin !== undefined && bookmark.parentId === origin.parentId
+            : bookmark.parentId === bookmark.rootId;
+          if (!parentOk || !scopeRootIds.has(bookmark.rootId)) {
+            dropped.push({ bookmarkId: bookmark.id, reason: 'parent-changed' });
+            continue;
+          }
         }
         bookmarks.push(bookmark);
       }
@@ -339,7 +355,13 @@ export class Organizer {
     const { proposal, review: state } = this.job;
     if (!proposal || !state) return [];
     const rootByFolder = new Map(this.existingFolders.map((f) => [f.id, f.rootId]));
-    return resolveMoves({ proposal, review: state, bookmarks: this.bookmarks, folderRoot: (id) => rootByFolder.get(id) });
+    return resolveMoves({
+      proposal,
+      review: state,
+      bookmarks: this.bookmarks,
+      folderRoot: (id) => rootByFolder.get(id),
+      origins: this.job.origins,
+    });
   }
 
   setCategory(bookmarkId: string, categoryId: string): void {
@@ -481,7 +503,13 @@ export class Organizer {
 
     const counts = { done: result.snapshot.applied.length, total: result.snapshot.items.length };
     if (result.ok) {
-      await this.commit({ phase: 'done', snapshotId: result.snapshot.id, skipped, ...counts }, token);
+      const live = await readBookmarkTree(api);
+      const emptiedFolders = listEmptiedUserFolders(
+        live,
+        result.snapshot.items.map((item) => item.fromParentId),
+        new Set(result.snapshot.createdFolderIds),
+      );
+      await this.commit({ phase: 'done', snapshotId: result.snapshot.id, skipped, emptiedFolders, ...counts }, token);
       return;
     }
 
@@ -606,4 +634,8 @@ export class Organizer {
     this.emit();
     void this.persist(this.job);
   }
+}
+
+function originsFrom(bookmarks: ReadonlyArray<Pick<FlatBookmark, 'id' | 'parentId' | 'rootId'>>): Record<string, BookmarkOrigin> {
+  return Object.fromEntries(bookmarks.map((bookmark) => [bookmark.id, { parentId: bookmark.parentId, rootId: bookmark.rootId }]));
 }

@@ -11,9 +11,10 @@ import { useSettings } from '@/composables/useSettings';
 import { useSnapshotRecovery } from '@/composables/useSnapshotRecovery';
 import { domainHistogram, findDuplicates } from '@/lib/ai/sampling';
 import { describeBookmarkError, describeSkipReason } from '@/lib/bookmarks/errors';
-import { listReusableFolders, selectBookmarksInScope, type RootInfo } from '@/lib/bookmarks/tree';
+import { countSelectedByRoot, listReusableFolders, selectBookmarksInScope, type RootInfo } from '@/lib/bookmarks/tree';
 import { RUNNING_PHASES } from '@/lib/jobs/organizer';
 import { describeRestoreSummary, restoreAnomalies } from '@/lib/jobs/recovery';
+import { isKeepStillMove } from '@/lib/jobs/resolve';
 
 const { tree, loading: treeLoading, error: treeError, reload } = useBookmarkTree();
 const { settings, loaded: settingsLoaded, hasApiKey, flush } = useSettings();
@@ -114,8 +115,18 @@ function dismissError(): void {
 
 // ------------------------------------------------------------------ step 1: scope
 
+const includeFoldered = ref(true);
+watch(
+  [settingsLoaded, () => settings.value.includeFoldered],
+  ([loaded]) => {
+    if (!loaded) return;
+    includeFoldered.value = settings.value.includeFoldered ?? true;
+  },
+  { immediate: true },
+);
+
 const inScope = computed(() =>
-  tree.value ? selectBookmarksInScope(tree.value, settings.value.scope, settings.value.debugLimit) : [],
+  tree.value ? selectBookmarksInScope(tree.value, settings.value.scope, settings.value.debugLimit, includeFoldered.value) : [],
 );
 
 const scopeRoots = computed<RootInfo[]>(() => {
@@ -125,9 +136,9 @@ const scopeRoots = computed<RootInfo[]>(() => {
 });
 
 const countByRoot = computed(() => {
-  const counts = new Map<string, number>();
-  for (const bookmark of inScope.value) counts.set(bookmark.rootId, (counts.get(bookmark.rootId) ?? 0) + 1);
-  return scopeRoots.value.map((root) => ({ root, count: counts.get(root.id) ?? 0 }));
+  if (!tree.value) return [];
+  const byId = new Map(countSelectedByRoot(tree.value, inScope.value).map((row) => [row.root.id, row]));
+  return scopeRoots.value.map((root) => byId.get(root.id) ?? { root, total: 0, loose: 0, foldered: 0 });
 });
 
 function rootLabel(root: RootInfo): string {
@@ -166,8 +177,9 @@ async function startGenerate(): Promise<void> {
   // 记住这次的 seeds / hint，下次打开还是这些
   settings.value.seedCategories = [...seeds.value];
   settings.value.userHint = hint.value;
+  settings.value.includeFoldered = includeFoldered.value;
   await flush();
-  await organize.start({ seedCategories: seeds.value, userHint: hint.value });
+  await organize.start({ seedCategories: seeds.value, userHint: hint.value, includeFoldered: includeFoldered.value });
 }
 
 // ------------------------------------------------------------------ step 2: progress
@@ -210,6 +222,11 @@ const excludedCount = computed(() => job.value.review?.excluded.length ?? 0);
 
 // 读一下 proposal / review，编辑后才会重新计算（organizer 内部状态本身不是响应式的）
 const plannedMoves = computed(() => (phase.value === 'review' && job.value.proposal && job.value.review ? organize.plannedMoves() : []));
+const keepStillMoves = computed(() => plannedMoves.value.filter(isKeepStillMove));
+const movingMoves = computed(() => plannedMoves.value.filter((move) => !isKeepStillMove(move)));
+const keepStillIds = computed(() => new Set(keepStillMoves.value.map((move) => move.bookmarkId)));
+const keepStillSkipped = computed(() => job.value.skipped.filter((s) => s.reason === 'same-parent'));
+const emptiedFolders = computed(() => job.value.emptiedFolders ?? []);
 const plannedFolders = computed(() => {
   const folderPath = new Map(jobFolders.value.map((f) => [f.id, f.path]));
   const paths = new Set<string>();
@@ -225,9 +242,10 @@ const applyBusy = ref(false);
 const applyNote = ref<string | null>(null);
 
 async function apply(): Promise<void> {
-  if (applyBusy.value || plannedMoves.value.length === 0) return;
+  if (applyBusy.value || movingMoves.value.length === 0) return;
   const backupNote = settings.value.autoBackup ? '应用前会先下载一份 HTML 备份。' : '注意：已在设置中关闭自动备份。';
-  if (!window.confirm(`将移动 ${plannedMoves.value.length} 条书签、新建最多 ${plannedFolders.value.length} 个文件夹。${backupNote}\n继续？`)) return;
+  const keepNote = keepStillMoves.value.length > 0 ? `，保持不动 ${keepStillMoves.value.length} 条` : '';
+  if (!window.confirm(`将移动 ${movingMoves.value.length} 条书签${keepNote}、新建最多 ${plannedFolders.value.length} 个文件夹。${backupNote}\n继续？`)) return;
   applyBusy.value = true;
   applyNote.value = null;
   try {
@@ -255,7 +273,9 @@ async function cancelApply(): Promise<void> {
 
 const skippedRows = computed(() => {
   const titles = new Map(jobBookmarks.value.map((b) => [b.id, b.title]));
-  return job.value.skipped.map((s) => ({ ...s, title: titles.get(s.bookmarkId) ?? s.bookmarkId, text: describeSkipReason(s.reason) }));
+  return job.value.skipped
+    .filter((s) => s.reason !== 'same-parent')
+    .map((s) => ({ ...s, title: titles.get(s.bookmarkId) ?? s.bookmarkId, text: describeSkipReason(s.reason) }));
 });
 
 /** 当前持久化的 snapshot 是否就是本次 apply 产生的那份。 */
@@ -375,13 +395,20 @@ function openOptions(): void {
         </p>
         <template v-else>
           <p>
-            范围：<span class="font-medium text-gray-800">{{ settings.scope === 'loose-other' ? '「其他书签」里的散装书签' : '「其他书签」+ 书签栏的散装书签' }}</span>
+            范围：<span class="font-medium text-gray-800">{{ settings.scope === 'loose-other' ? '「其他书签」' : '「其他书签」+ 书签栏' }}</span>
             <span v-if="settings.debugLimit"> · debugLimit = {{ settings.debugLimit }}</span>
-            <button type="button" class="ml-2 underline" @click="openOptions">修改</button>
+            <button type="button" class="ml-2 underline" @click="openOptions">修改根范围</button>
           </p>
+          <label class="mt-2 flex items-start gap-2">
+            <input v-model="includeFoldered" type="checkbox" class="mt-0.5" :disabled="running" />
+            <span>
+              包含已在文件夹中的书签
+              <span class="block text-gray-500">关闭时只整理根目录下的散装书签</span>
+            </span>
+          </label>
           <ul class="mt-1 space-y-0.5">
-            <li v-for="{ root, count } in countByRoot" :key="root.id">
-              {{ rootLabel(root) }}：将处理 <span class="font-medium text-gray-800">{{ count }}</span> 条散装书签
+            <li v-for="{ root, total, loose, foldered } in countByRoot" :key="root.id">
+              {{ rootLabel(root) }}：共 <span class="font-medium text-gray-800">{{ total }}</span> 条（散装 {{ loose }}，文件夹内 {{ foldered }}）
             </li>
           </ul>
           <p class="mt-1">
@@ -440,6 +467,7 @@ function openOptions(): void {
         <p class="text-xs text-gray-500">
           {{ job.proposal.categories.length }} 个类目 · {{ jobBookmarks.length }} 条书签
           <span v-if="excludedCount > 0"> · 已剔除 {{ excludedCount }}</span>
+          <span v-if="keepStillMoves.length > 0"> · 保持不动 {{ keepStillMoves.length }}</span>
           <span v-if="job.proposal.warnings.unknownCategory + job.proposal.warnings.missingIndex > 0" class="text-amber-700">
             · 模型输出兜底 {{ job.proposal.warnings.unknownCategory + job.proposal.warnings.missingIndex }} 条
           </span>
@@ -454,6 +482,7 @@ function openOptions(): void {
         :bookmarks="jobBookmarks"
         :review="job.review"
         :existing-folders="jobFolders"
+        :keep-still-ids="keepStillIds"
         @set-category="(id, c) => organizer.setCategory(id, c)"
         @merge="(from, into) => organizer.mergeCategories(from, into)"
         @rename="(id, title) => organizer.renameCategory(id, title)"
@@ -492,7 +521,11 @@ function openOptions(): void {
       <!-- 4a · 应用前确认 -->
       <template v-if="phase === 'review'">
         <div class="text-xs text-gray-600">
-          <p>将移动 <span class="font-medium text-gray-800">{{ plannedMoves.length }}</span> 条书签；按路径新建 / 复用文件夹 {{ plannedFolders.length }} 个：</p>
+          <p>
+            将移动 <span class="font-medium text-gray-800">{{ movingMoves.length }}</span> 条书签
+            <template v-if="keepStillMoves.length > 0">，保持不动 {{ keepStillMoves.length }} 条</template>
+            ；按路径新建 / 复用文件夹 {{ plannedFolders.length }} 个：
+          </p>
           <ul class="mt-1 flex flex-wrap gap-1">
             <li v-for="path in plannedFolders" :key="path" class="rounded bg-gray-100 px-2 py-0.5">{{ path }}</li>
           </ul>
@@ -508,7 +541,7 @@ function openOptions(): void {
           <button
             type="button"
             class="rounded bg-gray-900 px-3 py-1.5 text-white hover:bg-gray-700 disabled:cursor-not-allowed disabled:opacity-50"
-            :disabled="plannedMoves.length === 0 || applyBusy"
+            :disabled="movingMoves.length === 0 || applyBusy"
             @click="apply"
           >
             {{ applyBusy ? '应用中…' : '应用' }}
@@ -530,6 +563,7 @@ function openOptions(): void {
         <div class="space-y-1 text-xs text-gray-700">
           <p class="text-sm text-gray-900">
             已移动 <span class="font-medium">{{ job.done }}</span> 条书签
+            <span v-if="keepStillSkipped.length > 0">，保持不动 {{ keepStillSkipped.length }} 条</span>
             <span v-if="skippedRows.length > 0">，跳过 {{ skippedRows.length }} 条</span>。
           </p>
           <p>
@@ -538,6 +572,10 @@ function openOptions(): void {
             <template v-else>未备份（已在设置中关闭）</template>
           </p>
         </div>
+
+        <p v-if="emptiedFolders.length > 0" class="rounded border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900">
+          {{ emptiedFolders.length }} 个原有文件夹已空，可手动删除：{{ emptiedFolders.map((f) => f.path.join('/')).join('、') }}
+        </p>
 
         <details v-if="skippedRows.length > 0" class="text-xs">
           <summary class="cursor-pointer text-gray-600">跳过的 {{ skippedRows.length }} 条（未移动）</summary>

@@ -9,6 +9,7 @@ export type ProviderConfig = {
 export type Settings = {
   provider: ProviderConfig;
   scope: 'loose-other' | 'loose-bar-and-other';   // 'selected' 放 V1.1
+  includeFoldered: boolean;   // 已在文件夹里的书签也进整理范围，默认 true
   maxDepth: 1 | 2;
   batchSize: number;          // 默认 30
   concurrency: 1 | 2 | 3;     // assign 批次并发，默认 2
@@ -18,6 +19,12 @@ export type Settings = {
   seedCategories: string[];   // 用户预填的顶层类目，可空
   userHint: string;           // 一句话偏好，可空
   debugLimit?: number;        // 只处理前 N 条，打通流程用
+};
+
+/** 制定计划时每条书签的位置；刷新恢复用它判断「parentId 未变」，不能再用「仍是散装」。 */
+export type BookmarkOrigin = {
+  parentId: string;
+  rootId: string;
 };
 
 export type FlatBookmark = {
@@ -97,6 +104,7 @@ export type JobPhase =
 export type JobInput = {
   seedCategories: string[];
   userHint: string;
+  includeFoldered?: boolean;
 };
 
 // review 阶段的人工编辑，随 job 一起落盘
@@ -131,4 +139,8 @@ export type OrganizeJob = {
   review?: ReviewState;
   backupFileName?: string;  // §5.3 第 0 步下载的备份文件名；未备份时为空
   restore?: RestoreSummary; // 撤销 / 回滚过一次之后有值
+  /** 范围内每条书签在制定计划时的 parentId + rootId；restore / resolveMoves 用。 */
+  origins?: Record<string, BookmarkOrigin>;
+  /** 应用后变空的、非本次新建的用户文件夹（只报告，绝不自动删除）。 */
+  emptiedFolders?: Array<{ id: string; path: string[] }>;
 };
