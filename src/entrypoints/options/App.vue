@@ -6,6 +6,7 @@ import { useHostPermission } from '@/composables/useHostPermission';
 import { useSettings } from '@/composables/useSettings';
 import { describeAiError, pingProvider } from '@/lib/ai/client';
 import { NOT_REQUESTABLE_HINT, isRequestableOrigin } from '@/lib/origins';
+import { clampRequestTimeoutMs } from '@/lib/request-timeout';
 import type { Settings } from '@/lib/types';
 
 const { settings, loaded, saving, error: saveError, hasApiKey, flush } = useSettings();
@@ -73,6 +74,12 @@ function setNumber(key: 'batchSize', value: string, min: number, max: number): v
 function setConcurrency(value: string): void {
   const n = Number(value);
   if (n === 1 || n === 2 || n === 3) settings.value.concurrency = n;
+}
+
+function setRequestTimeoutSeconds(value: string): void {
+  const n = Number.parseInt(value, 10);
+  if (!Number.isFinite(n)) return;
+  settings.value.requestTimeoutMs = clampRequestTimeoutMs(n * 1000);
 }
 
 function setMaxDepth(value: string): void {
@@ -184,6 +191,20 @@ function setLanguage(value: string): void {
           <option :value="2">2</option>
           <option :value="3">3</option>
         </select>
+
+        <label class="text-gray-600" for="request-timeout">请求超时（秒）</label>
+        <div class="flex items-center gap-2">
+          <input
+            id="request-timeout"
+            type="number"
+            min="30"
+            max="600"
+            class="w-28 rounded border border-gray-300 px-2 py-1"
+            :value="Math.round(settings.requestTimeoutMs / 1000)"
+            @change="setRequestTimeoutSeconds(($event.target as HTMLInputElement).value)"
+          />
+          <span class="text-xs text-gray-500">生成类目 / 归类每次请求的上限，默认 180 秒</span>
+        </div>
 
         <label class="text-gray-600" for="debug-limit">debugLimit</label>
         <div class="flex items-center gap-2">

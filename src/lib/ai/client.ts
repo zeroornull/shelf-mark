@@ -1,11 +1,12 @@
 import { z, type ZodType } from 'zod';
+import { DEFAULT_REQUEST_TIMEOUT_MS } from '../request-timeout';
 import type { ProviderConfig } from '../types';
 
 /**
  * OpenAI-compatible chat client（计划 §6.1）。不装官方 SDK，不 import `browser` / `wxt/*`：
  * `fetch` 作为参数注入（默认 `globalThis.fetch`），vitest 在 node 里直接跑。
  *
- * - `chatCompletion`：一次 `POST {baseUrl}/chat/completions`，含 429 / 5xx 退避、60s 超时、
+ * - `chatCompletion`：一次 `POST {baseUrl}/chat/completions`，含 429 / 5xx 退避、可配置超时（默认 180s）、
  *   以及「服务商不支持 `response_format` / `temperature` / `max_tokens`（400 里提到）→ 去掉重试」。
  *   去掉过的字段记在 `ProviderQuirks` 里，同一次运行内后续请求不再发送，避免每批都吃一次 400。
  * - `chatJson`：system + user → 剥围栏 → `JSON.parse` → zod；校验失败重试 1 次并附上错误。
@@ -31,7 +32,7 @@ export function createQuirks(): ProviderQuirks {
 export type AiErrorKind =
   | 'http'          // 非 2xx 且不可（再）重试
   | 'network'       // fetch 本身失败（CORS / 未授权 origin / 断网）
-  | 'timeout'       // 60s 超时
+  | 'timeout'       // AbortController 超时（默认 180s，ping 20s）
   | 'aborted'       // 调用方 signal 取消
   | 'empty'         // 2xx 但没有 choices[0].message.content
   | 'invalid-json'  // 剥围栏后仍不是 JSON
@@ -83,7 +84,7 @@ export type CompletionArgs = {
   maxTokens?: number;
   fetchImpl?: typeof fetch;
   signal?: AbortSignal;
-  /** 默认 60s。 */
+  /** 默认 180s。 */
   timeoutMs?: number;
   /** 429 / 5xx 最多尝试次数（含首次），默认 3。 */
   maxAttempts?: number;
@@ -100,7 +101,7 @@ export type CompletionResult = {
   requests: number;
 };
 
-export const DEFAULT_TIMEOUT_MS = 60_000;
+export const DEFAULT_TIMEOUT_MS = DEFAULT_REQUEST_TIMEOUT_MS;
 const DEFAULT_MAX_ATTEMPTS = 3;
 const DEFAULT_RETRY_BASE_MS = 1000;
 const DETAIL_LIMIT = 300;
@@ -376,7 +377,7 @@ export async function chatJson<T>(args: ChatJsonArgs<T>): Promise<T> {
 }
 
 /** 注入给 taxonomy / assign / organizer 的 chat 函数：provider、fetch、quirks 都已绑定。 */
-export type ChatFn = <T>(args: { system: string; user: string; schema: ZodType<T>; signal?: AbortSignal }) => Promise<T>;
+export type ChatFn = <T>(args: { system: string; user: string; schema: ZodType<T>; signal?: AbortSignal; timeoutMs?: number }) => Promise<T>;
 
 export type ChatClientOptions = {
   fetchImpl?: typeof fetch;

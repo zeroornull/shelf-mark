@@ -218,14 +218,43 @@ describe('timeout and abort', () => {
         init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
       });
 
-    const promise = chatJson({ provider, system: 'S', user: 'U', schema, fetchImpl: hanging, timeoutMs: 60_000 });
+    const promise = chatJson({ provider, system: 'S', user: 'U', schema, fetchImpl: hanging });
     const settled = promise.catch((e: unknown) => e);
-    await vi.advanceTimersByTimeAsync(59_999);
+    await vi.advanceTimersByTimeAsync(179_999);
     await vi.advanceTimersByTimeAsync(1);
     const error = await settled;
     expect(error).toBeInstanceOf(AiError);
     expect((error as AiError).kind).toBe('timeout');
-    expect(describeAiError(error)).toContain('超时');
+    expect(describeAiError(error)).toBe('请求超时：请求超时（180s）');
+  });
+
+  it('puts the configured timeoutMs in the error, not a hardcoded 60s', async () => {
+    vi.useFakeTimers();
+    const hanging: typeof fetch = (_input, init) =>
+      new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+      });
+
+    const promise = chatJson({ provider, system: 'S', user: 'U', schema, fetchImpl: hanging, timeoutMs: 90_000 });
+    const settled = promise.catch((e: unknown) => e);
+    await vi.advanceTimersByTimeAsync(90_000);
+    const error = await settled;
+    expect((error as AiError).kind).toBe('timeout');
+    expect(describeAiError(error)).toBe('请求超时：请求超时（90s）');
+  });
+
+  it('createChatFn forwards timeoutMs into chatJson', async () => {
+    vi.useFakeTimers();
+    const hanging: typeof fetch = (_input, init) =>
+      new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+      });
+    const chat = createChatFn(provider, { fetchImpl: hanging, timeoutMs: 45_000 });
+    const settled = chat({ system: 'S', user: 'U', schema }).catch((e: unknown) => e);
+    await vi.advanceTimersByTimeAsync(45_000);
+    const error = await settled;
+    expect((error as AiError).kind).toBe('timeout');
+    expect(describeAiError(error)).toBe('请求超时：请求超时（45s）');
   });
 
   it('propagates an external AbortSignal as kind aborted', async () => {
@@ -310,6 +339,20 @@ describe('chatCompletion / pingProvider', () => {
     await pingProvider(provider, { fetchImpl: fn });
     expect(calls).toHaveLength(2);
     expect(calls[1]?.body).not.toHaveProperty('max_tokens');
+  });
+
+  it('ping times out at 20s, not the 180s chat default', async () => {
+    vi.useFakeTimers();
+    const hanging: typeof fetch = (_input, init) =>
+      new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+      });
+    const settled = pingProvider(provider, { fetchImpl: hanging }).catch((e: unknown) => e);
+    await vi.advanceTimersByTimeAsync(19_999);
+    await vi.advanceTimersByTimeAsync(1);
+    const error = await settled;
+    expect((error as AiError).kind).toBe('timeout');
+    expect(describeAiError(error)).toBe('请求超时：请求超时（20s）');
   });
 
   it('ping does not swallow 429 into retries', async () => {

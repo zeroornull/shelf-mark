@@ -4,6 +4,7 @@ import { createChromeBookmarksApi, type BookmarkTreeNode } from '@/lib/bookmarks
 import { backupFileName, downloadBackup, renderNetscapeHtml } from '@/lib/bookmarks/backup';
 import { Organizer, type OrganizerState } from '@/lib/jobs/organizer';
 import { jobStorage, loadSnapshotFromStorage, persistJobToStorage, persistSnapshotToStorage } from '@/lib/jobs/store';
+import { clampRequestTimeoutMs } from '@/lib/request-timeout';
 import type { JobInput, Settings, Snapshot } from '@/lib/types';
 
 /**
@@ -12,11 +13,15 @@ import type { JobInput, Settings, Snapshot } from '@/lib/types';
  */
 export function useOrganizeJob(settings: Ref<Settings>) {
   // provider 变了就换一个 client（quirks 是按 provider 记的）
-  let chat: ChatFn = createChatFn(settings.value.provider);
+  let chat: ChatFn = createChatFn(settings.value.provider, {
+    timeoutMs: clampRequestTimeoutMs(settings.value.requestTimeoutMs),
+  });
   watch(
     () => JSON.stringify(settings.value.provider),
     () => {
-      chat = createChatFn(settings.value.provider);
+      chat = createChatFn(settings.value.provider, {
+        timeoutMs: clampRequestTimeoutMs(settings.value.requestTimeoutMs),
+      });
     },
   );
 
@@ -29,7 +34,7 @@ export function useOrganizeJob(settings: Ref<Settings>) {
 
   const organizer = new Organizer({
     bookmarksApi: createChromeBookmarksApi(),
-    chat: (args) => chat(args),
+    chat: (args) => chat({ ...args, timeoutMs: clampRequestTimeoutMs(settings.value.requestTimeoutMs) }),
     persistJob: persistJobToStorage,
     persistSnapshot: persistSnapshotToStorage,
     loadSnapshot: loadSnapshotFromStorage,

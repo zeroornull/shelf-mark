@@ -17,7 +17,7 @@ describe('describeAiError table (§13)', () => {
     ['other 4xx', http(418), /^HTTP 418$/],
     ['network (Failed to fetch)', new AiError('network', 'TypeError: Failed to fetch', { hint: '可能是 CORS 或未授权该 origin，去设置页重新测试连接' }), /^CORS \/ 未授权 origin：可能是 CORS 或未授权该 origin，去设置页重新测试连接（TypeError: Failed to fetch）$/],
     ['raw TypeError from fetch', new TypeError('Failed to fetch'), /^CORS \/ 未授权 origin：.*去设置页重新测试连接（Failed to fetch）$/],
-    ['timeout', new AiError('timeout', '请求超时（60s）'), /^请求超时：请求超时（60s）$/],
+    ['timeout', new AiError('timeout', '请求超时（180s）'), /^请求超时：请求超时（180s）$/],
     ['aborted', new AiError('aborted', '已取消'), /^已取消$/],
     ['empty content', new AiError('empty', '模型没返回内容（choices[0].message.content 为空）'), /^模型没返回完整 JSON：模型没返回内容/],
     ['invalid json', new AiError('invalid-json', '模型没返回完整 JSON：Unexpected token'), /^模型没返回完整 JSON：Unexpected token$/],

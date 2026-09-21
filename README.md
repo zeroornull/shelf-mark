@@ -42,7 +42,7 @@ Chrome → `chrome://extensions` → 打开「开发者模式」→「加载已�
 - Ollama / LM Studio：`http://localhost/*` 已在可选权限列表里（任意端口）。Ollama 默认只监听 `127.0.0.1:11434`，用 `http://localhost:11434/v1` 或 `http://127.0.0.1:11434/v1` 都行；若浏览器报 403，把 Ollama 的 `OLLAMA_ORIGINS` 设为包含 `chrome-extension://*`。
 - 推理类模型拒绝 `temperature` / `max_tokens` / `response_format` 时会自动去掉该字段重试一次。
 
-其余设置：整理范围（「其他书签」，或加上书签栏）、是否包含已在文件夹中的书签（`includeFoldered`，默认开；关掉则只整理根下散装书签）、文件夹层数（1 或 2）、类目语言、每批条数、并发、仅域名模式、是否自动备份、默认 `seedCategories` / `userHint`，以及打通流程用的 `debugLimit`（只处理前 N 条，建议先用 20 试跑）。
+其余设置：整理范围（「其他书签」，或加上书签栏）、是否包含已在文件夹中的书签（`includeFoldered`，默认开；关掉则只整理根下散装书签）、文件夹层数（1 或 2）、类目语言、每批条数、并发、请求超时（默认 180 秒，生成类目 / 归类每次请求的上限）、仅域名模式、是否自动备份、默认 `seedCategories` / `userHint`，以及打通流程用的 `debugLimit`（只处理前 N 条，建议先用 20 试跑）。
 
 ## 整理流程
 

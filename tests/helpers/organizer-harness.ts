@@ -19,6 +19,7 @@ export const settings = (overrides: Partial<Settings> = {}): Settings => ({
   maxDepth: 2,
   batchSize: 10,
   concurrency: 2,
+  requestTimeoutMs: 180_000,
   language: 'zh',
   domainOnly: false,
   autoBackup: true,

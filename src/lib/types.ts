@@ -13,6 +13,7 @@ export type Settings = {
   maxDepth: 1 | 2;
   batchSize: number;          // 默认 30
   concurrency: 1 | 2 | 3;     // assign 批次并发，默认 2
+  requestTimeoutMs: number;   // 生成类目 / 归类每次请求上限，默认 180_000；读写时夹到 30s–10min
   language: 'zh' | 'en' | 'auto';
   domainOnly: boolean;        // 仅域名模式：url 字段只发 hostname
   autoBackup: boolean;        // 应用前自动下载 HTML 备份，默认 true
