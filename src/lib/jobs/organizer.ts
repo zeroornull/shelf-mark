@@ -4,7 +4,7 @@ import { detectLanguage, findDuplicates } from '../ai/sampling';
 import { proposeTaxonomy, refineTaxonomy } from '../ai/taxonomy';
 import type { BookmarksApi, BookmarkTreeNode } from '../bookmarks/api';
 import { describeBookmarkError } from '../bookmarks/errors';
-import { applySnapshot, type ApplyResult, type PlannedMove } from '../bookmarks/snapshot';
+import { ApplySnapshotError, applySnapshot, type ApplyResult, type PlannedMove } from '../bookmarks/snapshot';
 import {
   listReusableFolders,
   readBookmarkTree,
@@ -62,8 +62,9 @@ export type OrganizerState = {
 export type OrganizerListener = (state: OrganizerState) => void;
 
 /**
- * 正在读树 / 打模型 / 写书签的阶段；这些阶段刷新页面后不可恢复，`restore()` 直接丢弃。
- * 被中断的 `applying` 不通过 job 恢复，而是由持久化的 snapshot（`status: 'applying'`）驱动回滚横幅（§5.3）。
+ * 正在读树 / 打模型 / 写书签的阶段；这些阶段刷新页面后不可恢复，`restore()` 不会恢复它们。
+ * 生成阶段的 job 会被清掉；`applying` 的 job **原样留在存储里**（可能是另一个 organize 页正在写），
+ * 被中断的 apply 由持久化的 snapshot（`status: 'applying'`）驱动回滚横幅（§5.3）。
  */
 export const RUNNING_PHASES: ReadonlySet<OrganizeJob['phase']> = new Set(['loading-tree', 'proposing', 'assigning', 'refining', 'applying']);
 
@@ -195,35 +196,51 @@ export class Organizer {
 
   /**
    * 页面加载时恢复持久化的 job。review / done / error 原样恢复（有 proposal 时重新读树 join 出书签，
-   * 不重打模型）；正在运行中的阶段（含 applying）没法续跑，直接丢弃并清掉存储——被中断的 apply 由持久化的
-   * snapshot 驱动回滚横幅，不当作可恢复的 job。返回是否恢复了一个 job。
+   * 不重打模型；review 只保留仍是散装的书签，其余记入 skipped）；生成阶段的 job 没法续跑，丢弃并清掉存储；
+   * `applying` 的 job 不恢复也不清（可能是另一个页面正在写，被中断的情况由 snapshot 横幅处理）。返回是否恢复了一个 job。
    */
   async restore(saved: OrganizeJob | null): Promise<boolean> {
-    if (!saved || saved.phase === 'idle' || RUNNING_PHASES.has(saved.phase)) {
-      if (saved) await this.persist(null);
+    if (!saved || saved.phase === 'idle') return false;
+    if (saved.phase === 'applying') {
+      // 可能是另一个 organize 页正在写（多开标签）——绝不能清掉它的 job；真被中断的情况由 snapshot 横幅处理
+      return false;
+    }
+    if (RUNNING_PHASES.has(saved.phase)) {
+      await this.persist(null);
       return false;
     }
     this.job = saved;
     if (saved.proposal) {
+      const settings = this.settings();
       const tree = await readBookmarkTree(this.deps.bookmarksApi);
       this.tree = tree;
-      this.existingFolders = this.scopeRoots(tree, this.settings()).flatMap((root) => listReusableFolders(tree, root.id));
+      const scopeRootIds = new Set(this.scopeRoots(tree, settings).map((root) => root.id));
+      this.existingFolders = [...scopeRootIds].flatMap((rootId) => listReusableFolders(tree, rootId));
       const byId = new Map(tree.bookmarks.map((b) => [b.id, b]));
       const bookmarks: FlatBookmark[] = [];
-      const missing: string[] = [];
+      const dropped: OrganizeJob['skipped'] = [];
       for (const assignment of saved.proposal.assignments) {
         const bookmark = byId.get(assignment.bookmarkId);
-        if (bookmark) bookmarks.push(bookmark);
-        else missing.push(assignment.bookmarkId);
+        if (!bookmark) {
+          dropped.push({ bookmarkId: assignment.bookmarkId, reason: 'missing' });
+          continue;
+        }
+        // review：只保留仍是散装（直接挂在范围内的根下）的书签。用户在预览和刷新之间自己归档的，
+        // 不能因为重新读树而把「parentId 未变」校验对齐到新位置（§5.3 第 1 步说的是跳过）
+        if (saved.phase === 'review' && !(bookmark.parentId === bookmark.rootId && scopeRootIds.has(bookmark.rootId))) {
+          dropped.push({ bookmarkId: bookmark.id, reason: 'parent-changed' });
+          continue;
+        }
+        bookmarks.push(bookmark);
       }
       this.bookmarks = bookmarks;
-      // 只有 review 才把消失的书签剔出计划；done / error 是历史结果，原样展示
-      if (saved.phase === 'review' && missing.length > 0) {
-        const gone = new Set(missing);
+      // 只有 review 才把这些书签剔出计划；done / error 是历史结果，原样展示（书签列表仍按现存的 join）
+      if (saved.phase === 'review' && dropped.length > 0) {
+        const gone = new Set(dropped.map((d) => d.bookmarkId));
         this.job = {
           ...saved,
           proposal: { ...saved.proposal, assignments: saved.proposal.assignments.filter((a) => !gone.has(a.bookmarkId)) },
-          skipped: [...saved.skipped, ...missing.map((bookmarkId) => ({ bookmarkId, reason: 'missing' }))],
+          skipped: [...saved.skipped, ...dropped],
         };
       }
       if (!this.job.review) this.job = { ...this.job, review: review.defaultReviewState() };
@@ -252,12 +269,17 @@ export class Organizer {
 
     const token = ++this.runToken;
     this.stopRequested = false;
-    const run = this.runApply(token, this.settings(), moves);
-    this.applying = run;
+    // 标记必须在 runApply 同步 commit('applying') 并通知监听者之前就位：监听者里同步调用 cancel() 也要走停止分支
+    let settle!: () => void;
+    const marker = new Promise<void>((resolve) => {
+      settle = resolve;
+    });
+    this.applying = marker;
     try {
-      await run;
+      await this.runApply(token, this.settings(), moves);
     } finally {
-      if (this.applying === run) this.applying = null;
+      settle();
+      if (this.applying === marker) this.applying = null;
     }
   }
 
@@ -443,20 +465,36 @@ export class Organizer {
         onProgress: (done, total) => this.progress(token, done, total),
       });
     } catch (error) {
-      // 校验 / 建文件夹阶段抛错：applySnapshot 已收回新建的空文件夹，没 move 任何书签、也没落盘 snapshot
-      await this.commit({ phase: 'error', error: `写入失败，未移动任何书签：${describeBookmarkError(error)}` }, token);
+      // applySnapshot 只会在 prepare 阶段抛（校验 / 建文件夹 / 首次落盘），此时没 move 任何书签、空文件夹已收回
+      const untouched = error instanceof ApplySnapshotError && error.stage === 'prepare';
+      const text = untouched ? '写入失败，未移动任何书签' : '写入过程中出错，书签状态未知，请检查书签管理器';
+      await this.commit({ phase: 'error', error: `${text}：${describeBookmarkError(error)}` }, token);
       return;
     }
 
     const skipped = [...this.job.skipped, ...result.skipped];
+    if (result.nothingToDo) {
+      // 校验后一条都不用动：没有落盘 snapshot（上一份可撤销的 snapshot 原样保留），回到预览
+      await this.commit({ phase: 'review', error: '没有可移动的书签，未改动任何书签', skipped }, token);
+      return;
+    }
+
     const counts = { done: result.snapshot.applied.length, total: result.snapshot.items.length };
     if (result.ok) {
       await this.commit({ phase: 'done', snapshotId: result.snapshot.id, skipped, ...counts }, token);
       return;
     }
 
-    const restore = result.rollback ? summarizeRestore(result.rollback, result.stopped ? 'cancel' : 'failure') : undefined;
-    const ratio = restore ? `${restore.restored}/${restore.total}` : '0/0';
+    if (!result.rollback) {
+      // 回滚本身也失败：snapshot 留在 'applying'，中断横幅（本页 / sidepanel）可以再次回滚
+      const head = result.stopped ? '已取消，但回滚失败' : `写入失败：${describeBookmarkError(result.error)}；回滚也失败`;
+      const error = `${head}（已移动的 ${counts.done}/${counts.total} 条仍在新位置）：${describeBookmarkError(result.rollbackError)}。可用「上次整理被中断」横幅重试回滚。`;
+      await this.commit({ phase: 'error', error, snapshotId: result.snapshot.id, skipped, ...counts }, token);
+      return;
+    }
+
+    const restore = summarizeRestore(result.rollback, result.stopped ? 'cancel' : 'failure');
+    const ratio = `${restore.restored}/${restore.total}`;
     const error = result.stopped
       ? `已取消，已回滚 ${ratio}`
       : `写入失败，已回滚 ${ratio}：${describeBookmarkError(result.error)}`;

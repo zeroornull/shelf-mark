@@ -8,6 +8,7 @@ import type { FlatBookmark, Proposal, ReviewState } from '../types';
  *
  * - 剔除的、未勾选的 uncategorized / 重复项不动
  * - `existingFolderId` 只对同一根下的书签生效（`ResolvedMove`）；另一根按同名路径新建（`PathMove`）
+ * - 父类目复用了同根已有文件夹时，子类目以它为起点（`PathMove.baseParentId`），不在根下重建同名父文件夹
  * - 勾选 uncategorized 时，这些条目移入各自根下的「未分类」文件夹
  * - 同 parent 的条目由 `applySnapshot` 以 'same-parent' 剔除，这里不判断
  */
@@ -48,6 +49,12 @@ export function resolveMoves(input: ResolveMovesInput): PlannedMove[] {
     if (!category) continue;
     if (category.existingFolderId !== undefined && input.folderRoot(category.existingFolderId) === bookmark.rootId) {
       moves.push({ bookmarkId: bookmark.id, toParentId: category.existingFolderId, expectedParentId: bookmark.parentId });
+      continue;
+    }
+    // 父类目复用了同根的已有文件夹（可能在任意深度）：子类目建在它下面，而不是按标题在根下再建一个同名父文件夹
+    const parent = category.parentId !== undefined ? byId.get(category.parentId) : undefined;
+    if (parent?.existingFolderId !== undefined && input.folderRoot(parent.existingFolderId) === bookmark.rootId) {
+      moves.push({ bookmarkId: bookmark.id, baseParentId: parent.existingFolderId, toPath: [category.title], expectedParentId: bookmark.parentId });
       continue;
     }
     moves.push({ bookmarkId: bookmark.id, toPath: categoryPath(category, byId), expectedParentId: bookmark.parentId });

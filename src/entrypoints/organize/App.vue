@@ -19,8 +19,9 @@ const { tree, loading: treeLoading, error: treeError, reload } = useBookmarkTree
 const { settings, loaded: settingsLoaded, hasApiKey, flush } = useSettings();
 const organize = useOrganizeJob(settings);
 const { job, bookmarks: jobBookmarks, existingFolders: jobFolders, restoring, organizer } = organize;
-// 持久化 snapshot 的响应式视图：驱动「上次整理被中断」横幅和撤销按钮的可用性（本页就是 organize 页，不用探测自己）
-const recovery = useSnapshotRecovery(undefined, { trackOrganizePage: false });
+// 持久化 snapshot 的响应式视图：驱动「上次整理被中断」横幅和撤销按钮的可用性。
+// excludeSelf：探测「别的」organize 页——多开标签时另一个可能正在 apply，这时不能提供回滚
+const recovery = useSnapshotRecovery(undefined, { trackOrganizePage: true, excludeSelf: true });
 
 // ------------------------------------------------------------------ wizard steps
 
@@ -69,12 +70,21 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', onBeforeUnload)
 // ------------------------------------------------------------------ 中断横幅：上次 apply 没跑完（snapshot 仍是 applying）
 
 const showInterrupted = computed(() => recovery.interrupted.value && !applying.value && !restoring.value);
+/** 确认没有别的 organize 页在写，才能回滚；'open' / 'unknown' / 未查完 → 只显示中性提示。 */
+const canRollbackHere = computed(() => showInterrupted.value && recovery.canRollback.value);
+const otherOrganizeNote = computed(() => {
+  if (!showInterrupted.value || canRollbackHere.value) return null;
+  const counts = `已移动 ${recovery.appliedCount.value}/${recovery.totalCount.value}`;
+  if (recovery.organizePresence.value === 'open') return `另一个整理页正在处理这次整理（${counts}）。请在那个页面继续或回滚，不要在这里重复操作。`;
+  if (recovery.organizePresence.value === 'unknown') return `无法确认是否有其他整理页在处理（${counts}）。请先关闭其他整理页，再刷新本页回滚。`;
+  return `正在检查是否有其他整理页在处理（${counts}）…`;
+});
 const rollbackBusy = ref(false);
 const rollbackNote = ref<{ ok: boolean; text: string } | null>(null);
 
 async function rollbackInterrupted(): Promise<void> {
   const snapshot = recovery.snapshot.value;
-  if (!snapshot || rollbackBusy.value) return;
+  if (!snapshot || rollbackBusy.value || !canRollbackHere.value) return;
   if (!window.confirm(`回滚被中断的整理，把已移动的 ${snapshot.applied.length} 条书签移回原位置？`)) return;
   rollbackBusy.value = true;
   rollbackNote.value = null;
@@ -201,8 +211,14 @@ const excludedCount = computed(() => job.value.review?.excluded.length ?? 0);
 // 读一下 proposal / review，编辑后才会重新计算（organizer 内部状态本身不是响应式的）
 const plannedMoves = computed(() => (phase.value === 'review' && job.value.proposal && job.value.review ? organize.plannedMoves() : []));
 const plannedFolders = computed(() => {
+  const folderPath = new Map(jobFolders.value.map((f) => [f.id, f.path]));
   const paths = new Set<string>();
-  for (const move of plannedMoves.value) if ('toPath' in move) paths.add(move.toPath.join(' / '));
+  for (const move of plannedMoves.value) {
+    if (!('toPath' in move)) continue;
+    // 以已有文件夹为起点的子类目：显示完整路径「已有 / 子类目」
+    const base = move.baseParentId !== undefined ? (folderPath.get(move.baseParentId) ?? []) : [];
+    paths.add([...base, ...move.toPath].join(' / '));
+  }
   return [...paths];
 });
 const applyBusy = ref(false);
@@ -309,8 +325,11 @@ function openOptions(): void {
       <button type="button" class="text-xs text-gray-500 underline" @click="openOptions">设置</button>
     </header>
 
-    <!-- 上次整理被中断（snapshot 仍是 applying）：先回滚 -->
-    <section v-if="showInterrupted && recovery.snapshot.value" class="space-y-2 rounded border border-amber-300 bg-amber-50 px-3 py-2 text-amber-900">
+    <!-- snapshot 仍是 applying，但另一个整理页可能正在写：只提示，不给回滚 -->
+    <p v-if="otherOrganizeNote" class="rounded border border-gray-300 bg-gray-50 px-3 py-2 text-gray-700">{{ otherOrganizeNote }}</p>
+
+    <!-- 上次整理被中断（snapshot 仍是 applying，且没有别的整理页开着）：先回滚 -->
+    <section v-else-if="canRollbackHere && recovery.snapshot.value" class="space-y-2 rounded border border-amber-300 bg-amber-50 px-3 py-2 text-amber-900">
       <p class="flex flex-wrap items-center justify-between gap-2">
         <span>
           上次整理被中断，已移动 <span class="font-medium tabular-nums">{{ recovery.appliedCount.value }}/{{ recovery.totalCount.value }}</span>
@@ -424,7 +443,9 @@ function openOptions(): void {
           <span v-if="job.proposal.warnings.unknownCategory + job.proposal.warnings.missingIndex > 0" class="text-amber-700">
             · 模型输出兜底 {{ job.proposal.warnings.unknownCategory + job.proposal.warnings.missingIndex }} 条
           </span>
-          <span v-if="job.skipped.length > 0" class="text-amber-700"> · {{ job.skipped.length }} 条书签已不存在</span>
+          <span v-if="job.skipped.length > 0" class="text-amber-700" :title="skippedRows.map((r) => `${r.title}：${r.text}`).join('\n')">
+            · {{ job.skipped.length }} 条已跳过（已删除 / 已被归档）
+          </span>
         </p>
       </div>
 

@@ -5,6 +5,7 @@ import BookmarkTree from '@/components/BookmarkTree.vue';
 import UndoBar from '@/components/UndoBar.vue';
 import { useBookmarkTree } from '@/composables/useBookmarkTree';
 import { useHostPermission } from '@/composables/useHostPermission';
+import { focusOrOpenOrganizePage } from '@/composables/useOrganizeTab';
 import { useSettings } from '@/composables/useSettings';
 import type { RootInfo } from '@/lib/bookmarks/tree';
 
@@ -29,8 +30,9 @@ function rootLabel(root: RootInfo): string {
   return twins.length > 1 ? `${title}（${root.syncing ? '账号' : '本地'}）` : title;
 }
 
+/** 已有整理页就切过去（同一时间只该有一个整理页在写书签），没有才新开。 */
 function openOrganize(): void {
-  void browser.tabs.create({ url: browser.runtime.getURL('/organize.html') });
+  void focusOrOpenOrganizePage();
 }
 
 function openOptions(): void {

@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type { BookmarksApi } from '../src/lib/bookmarks/api';
 import { createFakeBookmarksApi, type SeedNode } from '../src/lib/bookmarks/fake';
 import { ensureFolderPath, removeEmptyCreatedFolders } from '../src/lib/bookmarks/mutate';
-import { applySnapshot, restoreSnapshot } from '../src/lib/bookmarks/snapshot';
+import { ApplySnapshotError, applySnapshot, restoreSnapshot, type PlannedMove } from '../src/lib/bookmarks/snapshot';
 import type { Snapshot } from '../src/lib/types';
 
 const seed = (): SeedNode[] => [
@@ -105,7 +105,7 @@ describe('applySnapshot validation (§5.3 step 1)', () => {
     expect(fake.getChildrenIds('F')).toEqual(['y', 'x']);
   });
 
-  it('with nothing left to move, removes folders it just created and persists an empty applied snapshot', async () => {
+  it('with nothing left to move, removes folders it just created and does NOT persist (the previous undoable snapshot survives)', async () => {
     const fake = createFakeBookmarksApi(seed());
     const original = fake.dump();
     const journal: Snapshot[] = [];
@@ -117,9 +117,39 @@ describe('applySnapshot validation (§5.3 step 1)', () => {
     });
 
     expect(result.ok).toBe(true);
-    expect(result.snapshot).toMatchObject({ status: 'applied', items: [], applied: [], createdFolderIds: [] });
-    expect(journal).toHaveLength(1);
+    expect(result.nothingToDo).toBe(true);
+    expect(result.skipped).toEqual([{ bookmarkId: 'ghost', reason: 'missing' }]);
+    expect(result.snapshot).toMatchObject({ items: [], applied: [], createdFolderIds: [] });
+    expect(journal).toEqual([]);
     expect(fake.dump()).toEqual(original);
+  });
+
+  it('all items skipped after folders were created (deleted meanwhile) → folders removed, nothing persisted', async () => {
+    const fake = createFakeBookmarksApi(seed());
+    const journal: Snapshot[] = [];
+    // z 在校验后、move 前被用户删掉：在第二次 getTree（ensureFolder 那次）时动手
+    let reads = 0;
+    const racy: BookmarksApi = {
+      getTree: async () => {
+        reads += 1;
+        if (reads === 2) await fake.remove('z');
+        return fake.getTree();
+      },
+      create: (d) => fake.create(d),
+      remove: (id) => fake.remove(id),
+      move: (id, dest) => fake.move(id, dest),
+    };
+    const result = await applySnapshot(racy, [{ bookmarkId: 'z', toPath: ['New'], expectedParentId: '2' }], {
+      persist: async (s) => {
+        journal.push(s);
+      },
+    });
+    expect(result).toMatchObject({ ok: true, nothingToDo: true, skipped: [{ bookmarkId: 'z', reason: 'missing' }] });
+    expect(journal).toEqual([]);
+    expect(fake.calls.move).toBe(0);
+    expect(fake.calls.create).toBe(1);
+    expect(fake.calls.remove).toBe(2); // 用户删 z + 收回 New
+    expect(fake.getChildrenIds('2').map((id) => fake.getNode(id)!.title)).toEqual(['x', '工作', 'S']);
   });
 
   it('cleans up created folders and rethrows if folder creation fails before anything is persisted', async () => {
@@ -211,6 +241,194 @@ describe('applySnapshot journal (§5.3 steps 4–8)', () => {
     ).rejects.toThrow('storage full');
     expect(fake.calls.move).toBe(0);
     expect(fake.dump()).toEqual(original);
+  });
+
+  it('[L7] initial persist failure also removes the folders just created, and the error is tagged stage=prepare', async () => {
+    const fake = createFakeBookmarksApi(seed());
+    const original = fake.dump();
+    let thrown: unknown;
+    try {
+      await applySnapshot(fake, [{ bookmarkId: 'x', toPath: ['New', 'Deep'] }], {
+        persist: async () => {
+          throw new Error('storage full');
+        },
+      });
+    } catch (e) {
+      thrown = e;
+    }
+    expect(thrown).toBeInstanceOf(ApplySnapshotError);
+    expect((thrown as ApplySnapshotError).stage).toBe('prepare');
+    expect((thrown as Error).message).toBe('storage full');
+    expect(fake.calls.create).toBe(2);
+    expect(fake.calls.remove).toBe(2);
+    expect(fake.calls.move).toBe(0);
+    expect(fake.dump()).toEqual(original);
+  });
+
+  it('[L6] a failing cleanup does not mask the original prepare error', async () => {
+    const fake = createFakeBookmarksApi(seed());
+    // 读树：#1 校验、#2 ensureFolder(New)、#3 是 removeEmptyCreatedFolders 的那次 → 让它炸
+    let reads = 0;
+    const broken: BookmarksApi = {
+      getTree: async () => {
+        reads += 1;
+        if (reads === 3) throw new Error('tree exploded during cleanup');
+        return fake.getTree();
+      },
+      create: (d) => fake.create(d),
+      move: (id, dest) => fake.move(id, dest),
+      remove: (id) => fake.remove(id),
+    };
+    await expect(
+      applySnapshot(
+        broken,
+        [
+          { bookmarkId: 'x', toPath: ['New'] },
+          { bookmarkId: 'z', toPath: ['   '] },
+        ],
+        { persist: async () => {} },
+      ),
+    ).rejects.toThrow(/empty/);
+    expect(reads).toBe(3);
+    // New 建了、收不回（清理自己失败），但抛出去的还是原始错误
+    expect(fake.getChildrenIds('2').map((id) => fake.getNode(id)!.title)).toContain('New');
+  });
+});
+
+describe('[M1] failures after the first move never bypass rollback', () => {
+  const moves = (): PlannedMove[] => [
+    { bookmarkId: 'x', toPath: ['New'] },
+    { bookmarkId: 'z', toPath: ['New'] },
+    { bookmarkId: 'a', toParentId: 'BarF' },
+  ];
+
+  it('journal persist throwing on the k-th write → the k-th move counts as applied, everything rolls back, status rolled-back', async () => {
+    const fake = createFakeBookmarksApi(seed());
+    const original = fake.dump();
+    const journal: Snapshot[] = [];
+    let writes = 0;
+    const result = await applySnapshot(fake, moves(), {
+      persist: async (s) => {
+        writes += 1;
+        if (writes === 3) throw new Error('quota exceeded'); // applying(0), after#1, after#2 ← throws
+        journal.push(s);
+      },
+    });
+    expect(result.ok).toBe(false);
+    expect(String(result.error)).toContain('quota exceeded');
+    expect(result.stopped).toBeUndefined();
+    // 第 2 条 move 已经成功：回滚必须把它算进去
+    expect(result.rollback).toMatchObject({ total: 2, restored: 2, failed: 0 });
+    expect(result.snapshot).toMatchObject({ status: 'rolled-back', applied: ['x', 'z'] });
+    expect(journal.at(-1)?.status).toBe('rolled-back');
+    expect(fake.dump()).toEqual(original);
+  });
+
+  it('restoreSnapshot itself throwing → ok:false with error + rollbackError, snapshot left applying so the banner can retry', async () => {
+    const fake = createFakeBookmarksApi(seed());
+    const original = fake.dump();
+    const journal: Snapshot[] = [];
+    let moveCalls = 0;
+    let treeReads = 0;
+    const flaky: BookmarksApi = {
+      getTree: async () => {
+        treeReads += 1;
+        // #1 校验、#2 ensureFolder(New)、#3 第 4 步重读；#4 是 restoreSnapshot 开头那次读树
+        if (treeReads === 4) throw new Error('bookmarks service unavailable');
+        return fake.getTree();
+      },
+      create: (d) => fake.create(d),
+      remove: (id) => fake.remove(id),
+      move: async (id, dest) => {
+        moveCalls += 1;
+        if (moveCalls === 2) throw new Error("Can't find bookmark for id z.");
+        return fake.move(id, dest);
+      },
+    };
+    const result = await applySnapshot(flaky, moves(), {
+      persist: async (s) => {
+        journal.push(s);
+      },
+    });
+    expect(result.ok).toBe(false);
+    expect(String(result.error)).toContain("Can't find bookmark");
+    expect(result.rollback).toBeUndefined();
+    expect(String(result.rollbackError)).toContain('service unavailable');
+    expect(result.snapshot).toMatchObject({ status: 'applying', applied: ['x'] });
+    expect(journal.at(-1)).toMatchObject({ status: 'applying', applied: ['x'] });
+    // x 还在新文件夹里；用持久化的 snapshot 走中断回滚路径就能恢复
+    expect(fake.getNode('x')?.parentId).toBe(result.snapshot.createdFolderIds[0]);
+    const restore = await restoreSnapshot(fake, journal.at(-1)!, 'rolled-back');
+    expect(restore).toMatchObject({ total: 1, restored: 1 });
+    expect(fake.dump()).toEqual(original);
+  });
+
+  it('final status persist throwing → treated as a failure after all moves: rolled back, tree equals original', async () => {
+    const fake = createFakeBookmarksApi(seed());
+    const original = fake.dump();
+    let writes = 0;
+    const result = await applySnapshot(fake, moves(), {
+      persist: async (s) => {
+        writes += 1;
+        if (s.status === 'applied') throw new Error('final write failed');
+      },
+    });
+    expect(result.ok).toBe(false);
+    expect(String(result.error)).toContain('final write failed');
+    expect(result.rollback).toMatchObject({ total: 3, restored: 3 });
+    expect(result.snapshot.status).toBe('rolled-back');
+    expect(writes).toBe(6); // applying + 3 + applied(throws) + rolled-back
+    expect(fake.dump()).toEqual(original);
+  });
+
+  it('a throwing onProgress listener does not turn into a write failure', async () => {
+    const fake = createFakeBookmarksApi(seed());
+    const result = await applySnapshot(fake, moves(), {
+      persist: async () => {},
+      onProgress: () => {
+        throw new Error('listener bug');
+      },
+    });
+    expect(result.ok).toBe(true);
+    expect(result.snapshot.applied).toEqual(['x', 'z', 'a']);
+  });
+});
+
+describe('[M4] PathMove.baseParentId: children of a reused nested folder', () => {
+  it('builds the sub-folder under baseParentId instead of creating a same-named folder at the root', async () => {
+    const fake = createFakeBookmarksApi(seed());
+    const result = await applySnapshot(fake, [{ bookmarkId: 'x', toPath: ['React'], baseParentId: 'F', expectedParentId: '2' }], { persist: async () => {} });
+    expect(result.ok).toBe(true);
+    const [react] = result.snapshot.createdFolderIds;
+    expect(fake.getNode(react!)).toMatchObject({ parentId: 'F', title: 'React' });
+    expect(fake.getNode('x')?.parentId).toBe(react);
+    // 根下没有新建任何文件夹
+    expect(fake.getChildrenIds('2').map((id) => fake.getNode(id)!.title)).toEqual(['工作', 'z', 'S']);
+    // undo 回到原状
+    await restoreSnapshot(fake, result.snapshot, 'undone');
+    expect(fake.getNode(react!)).toBeUndefined();
+    expect(fake.getChildrenIds('F')).toEqual(['y']);
+  });
+
+  it('reuses an existing child under baseParentId (normalize) and falls back to the root when baseParentId is in another root or missing', async () => {
+    const fake = createFakeBookmarksApi(seed());
+    await fake.create({ parentId: 'F', title: 'react' });
+    const result = await applySnapshot(
+      fake,
+      [
+        { bookmarkId: 'x', toPath: ['React'], baseParentId: 'F' }, // 复用 F/ react
+        { bookmarkId: 'z', toPath: ['Tools'], baseParentId: 'BarF' }, // BarF 在书签栏根 → 退回 other 根
+        { bookmarkId: 'a', toPath: ['Tools'], baseParentId: 'nope' }, // 不存在 → 退回 bar 根
+      ],
+      { persist: async () => {} },
+    );
+    expect(result.ok).toBe(true);
+    expect(result.skipped).toEqual([]);
+    const existingReact = fake.getChildrenIds('F').find((id) => fake.getNode(id)?.title === 'react')!;
+    expect(fake.getNode('x')?.parentId).toBe(existingReact);
+    expect(fake.getNode(fake.getNode('z')!.parentId!)).toMatchObject({ parentId: '2', title: 'Tools' });
+    expect(fake.getNode(fake.getNode('a')!.parentId!)).toMatchObject({ parentId: '1', title: 'Tools' });
+    expect(result.snapshot.createdFolderIds).toHaveLength(2);
   });
 });
 

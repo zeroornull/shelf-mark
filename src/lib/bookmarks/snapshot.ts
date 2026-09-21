@@ -18,8 +18,13 @@ import { findRootOf, indexRawTree, isBookmarkNode, positionOf } from './tree';
 /** 目标文件夹用「根以下的标题路径」表示，apply 时按书签自己的根 `ensureFolder`。 */
 export type PathMove = {
   bookmarkId: string;
-  /** 例 `['工作', '前端']`；空数组表示根本身。 */
+  /** 例 `['工作', '前端']`；空数组表示根本身（或 `baseParentId` 本身）。 */
   toPath: string[];
+  /**
+   * 路径的起点：默认是书签所属的根。父类目复用了已有文件夹时填该文件夹 id，子类目就建在它下面
+   * （§0「优先复用已有文件夹」）。不在书签同一根下 / 已不存在 → 退回从根开始。
+   */
+  baseParentId?: string;
 };
 
 /**
@@ -84,16 +89,34 @@ export type ApplyResult = {
   skipped: SkippedMove[];
   /** ok 为 false 且不是 stopped 时的原始错误。 */
   error?: unknown;
-  /** ok 为 false 时的回滚结果。 */
+  /** ok 为 false 且回滚成功时的回滚结果。 */
   rollback?: RestoreResult;
+  /** ok 为 false 且回滚本身也失败：snapshot 保持 'applying'（journal 是真实的），交给中断横幅再试。 */
+  rollbackError?: unknown;
   /** true：因 `shouldStop` 返回 true 而停止（不是失败）。 */
   stopped?: boolean;
+  /** true：校验后没有任何可移动的条目；**没有落盘**（不覆盖上一份可撤销的 snapshot），返回的 snapshot 只是占位。 */
+  nothingToDo?: boolean;
 };
+
+/**
+ * `applySnapshot` 唯一会抛出的错误类型。`stage: 'prepare'`：还没 move 任何书签（校验 / 建文件夹 / 首次落盘失败，
+ * 新建的空文件夹已收回）。move 开始之后的问题一律通过 `ApplyResult` 返回，不抛。
+ */
+export class ApplySnapshotError extends Error {
+  readonly stage: 'prepare';
+
+  constructor(stage: 'prepare', cause: unknown) {
+    super(cause instanceof Error ? cause.message : String(cause), { cause });
+    this.name = 'ApplySnapshotError';
+    this.stage = stage;
+  }
+}
 
 /** 通过校验、待解析目标的条目。 */
 type Pending =
   | { bookmarkId: string; rootId: string; kind: 'folder'; toParentId: string }
-  | { bookmarkId: string; rootId: string; kind: 'path'; toPath: string[] };
+  | { bookmarkId: string; rootId: string; kind: 'path'; toPath: string[]; baseParentId?: string };
 
 function cloneSnapshot(snapshot: Snapshot): Snapshot {
   return structuredClone(snapshot);
@@ -176,16 +199,30 @@ export async function applySnapshot(
       }
       pending.push({ bookmarkId, rootId: root.id, kind: 'folder', toParentId: move.toParentId });
     } else {
-      pending.push({ bookmarkId, rootId: root.id, kind: 'path', toPath: move.toPath });
+      // baseParentId 必须是同一根下仍存在的文件夹，否则退回从根开始建路径
+      let baseParentId: string | undefined;
+      if (move.baseParentId !== undefined) {
+        const base = index.get(move.baseParentId);
+        if (base && base.url === undefined && findRootOf(index, base.id)?.id === root.id) baseParentId = base.id;
+      }
+      pending.push({ bookmarkId, rootId: root.id, kind: 'path', toPath: move.toPath, ...(baseParentId !== undefined ? { baseParentId } : {}) });
     }
   }
 
   // 3. 建目标文件夹（追加末尾）。同一 apply 内相同 (parent, normalize(title)) 只 ensure 一次。
   const createdFolderIds: string[] = [];
   const folderCache = new Map<string, string>();
+  /** 收回本次新建的空文件夹；自身失败不遮盖原始错误。 */
+  const cleanupCreated = async (): Promise<string[]> => {
+    try {
+      return (await removeEmptyCreatedFolders(api, createdFolderIds)).kept;
+    } catch {
+      return [...createdFolderIds];
+    }
+  };
   const resolveTarget = async (item: Pending): Promise<string> => {
     if (item.kind === 'folder') return item.toParentId;
-    let parentId = item.rootId;
+    let parentId = item.baseParentId ?? item.rootId;
     for (const title of item.toPath) {
       const key = `${parentId}\u0000${normalizeTitle(title)}`;
       let id = folderCache.get(key);
@@ -231,8 +268,8 @@ export async function applySnapshot(
     }
   } catch (error) {
     // 还没 move 任何东西，也还没落盘：把刚建的空文件夹收回去，然后把错误抛给调用方
-    await removeEmptyCreatedFolders(api, createdFolderIds);
-    throw error;
+    await cleanupCreated();
+    throw new ApplySnapshotError('prepare', error);
   }
 
   const createdAt = now();
@@ -246,40 +283,63 @@ export async function applySnapshot(
   };
 
   if (items.length === 0) {
-    // 没有可移动的条目：新建的文件夹全是空的，直接收回，不留 'applying' 状态
-    const cleanup = await removeEmptyCreatedFolders(api, createdFolderIds);
-    snapshot.createdFolderIds = cleanup.kept;
+    // 没有可移动的条目：收回刚建的空文件夹；**不落盘**，否则会覆盖上一份还能撤销的 snapshot
+    snapshot.createdFolderIds = await cleanupCreated();
     snapshot.status = 'applied';
-    await persist(cloneSnapshot(snapshot));
-    return { ok: true, snapshot, skipped };
+    return { ok: true, snapshot, skipped, nothingToDo: true };
   }
 
-  // 5. 先落盘
-  await persist(cloneSnapshot(snapshot));
-  options.onProgress?.(0, items.length);
+  // 5. 先落盘。失败 → 还没 move，收回空文件夹再抛
+  try {
+    await persist(cloneSnapshot(snapshot));
+  } catch (error) {
+    await cleanupCreated();
+    throw new ApplySnapshotError('prepare', error);
+  }
 
-  // 6. 串行 move，不传 index
-  for (const item of items) {
-    if (options.shouldStop?.()) {
-      // 调用方要求停止（取消）：不再 move，对 applied 子集走与失败相同的回滚路径
-      const rollback = await restoreSnapshot(api, snapshot, 'rolled-back', persist);
-      return { ok: false, snapshot: rollback.snapshot, skipped, rollback, stopped: true };
+  // 进度回调只是通知，绝不能让它的异常变成「写入失败」
+  const progress = (done: number) => {
+    try {
+      options.onProgress?.(done, items.length);
+    } catch {
+      // ignore
     }
+  };
+  progress(0);
+
+  // 8. 对 applied 子集回滚；回滚自己也失败时 snapshot 保持 'applying'，留给中断横幅再试
+  const rollBack = async (error: unknown, stopped: boolean): Promise<ApplyResult> => {
+    const base = stopped ? { ok: false as const, skipped, stopped } : { ok: false as const, skipped, error };
+    try {
+      const rollback = await restoreSnapshot(api, snapshot, 'rolled-back', persist);
+      return { ...base, snapshot: rollback.snapshot, rollback };
+    } catch (rollbackError) {
+      return { ...base, snapshot: cloneSnapshot(snapshot), rollbackError };
+    }
+  };
+
+  // 6. 串行 move，不传 index；move 与 journal 落盘在同一个 try 里：落盘失败时 move 已经成功，必须先计入 applied 再回滚
+  for (const item of items) {
+    if (options.shouldStop?.()) return rollBack(undefined, true);
     try {
       await api.move(item.bookmarkId, { parentId: item.toParentId });
+      snapshot.applied.push(item.bookmarkId);
+      await persist(cloneSnapshot(snapshot));
     } catch (error) {
-      // 8. 对 applied 子集回滚
-      const rollback = await restoreSnapshot(api, snapshot, 'rolled-back', persist);
-      return { ok: false, snapshot: rollback.snapshot, skipped, error, rollback };
+      return rollBack(error, false);
     }
-    snapshot.applied.push(item.bookmarkId);
-    await persist(cloneSnapshot(snapshot));
-    options.onProgress?.(snapshot.applied.length, items.length);
+    progress(snapshot.applied.length);
   }
 
   // 7. 全部成功
   snapshot.status = 'applied';
-  await persist(cloneSnapshot(snapshot));
+  try {
+    await persist(cloneSnapshot(snapshot));
+  } catch (error) {
+    // 书签都已到位，只是最终状态没写进去：按失败回滚，让状态与存储一致
+    snapshot.status = 'applying';
+    return rollBack(error, false);
+  }
   return { ok: true, snapshot, skipped };
 }
 

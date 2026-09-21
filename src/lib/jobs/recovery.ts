@@ -40,21 +40,16 @@ export async function undoSnapshot(api: BookmarksApi, snapshot: Snapshot, persis
 }
 
 /**
- * 补上 journal 窗口：`move` 已经成功、但 `applied` 落盘之前页面就死了的那一条不在 `applied` 里，
- * 却已经躺在目标文件夹。把「不在 applied、当前 parent === toParentId（且 ≠ fromParentId）」的条目视为已应用，
- * 让回滚也把它们移回去。
+ * 补上 journal 窗口：move 是串行的、每条成功后才落盘，所以「move 成功但 `applied` 没写进去」的条目恰好只有一条：
+ * `items[applied.length]`（`applied` 是 `items` 的前缀）。只有它当前就在 `toParentId`（且 ≠ `fromParentId`）时才视为已应用；
+ * 更后面的条目即使躺在目标文件夹里也不碰——那是用户自己放进去的。
  */
 export async function reconcileInterruptedJournal(api: BookmarksApi, snapshot: Snapshot): Promise<Snapshot> {
-  const applied = new Set(snapshot.applied);
+  const next = snapshot.items[snapshot.applied.length];
+  if (!next || snapshot.applied.includes(next.bookmarkId) || next.toParentId === next.fromParentId) return snapshot;
   const index = indexRawTree(await api.getTree());
-  const extra: string[] = [];
-  for (const item of snapshot.items) {
-    if (applied.has(item.bookmarkId) || item.toParentId === item.fromParentId) continue;
-    const node = index.get(item.bookmarkId);
-    if (node?.parentId === item.toParentId) extra.push(item.bookmarkId);
-  }
-  if (extra.length === 0) return snapshot;
-  return { ...structuredClone(snapshot), applied: [...snapshot.applied, ...extra] };
+  if (index.get(next.bookmarkId)?.parentId !== next.toParentId) return snapshot;
+  return { ...structuredClone(snapshot), applied: [...snapshot.applied, next.bookmarkId] };
 }
 
 /** 中断后回滚：只接受 `status: 'applying'`，对 `applied` 子集（含 journal 窗口补上的）恢复，状态 → 'rolled-back'。 */

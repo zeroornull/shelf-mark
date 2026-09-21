@@ -276,6 +276,99 @@ describe('Organizer.apply – failure and cancel roll back', () => {
     expect(h.snapshots).toEqual([]);
   });
 
+  it('[M1] journal persist failing mid-apply → rolled back, error copy says 已回滚 (not 未移动任何书签)', async () => {
+    const h = harness(4);
+    const original = await reviewed(h);
+    const realPersist = h.snapshots;
+    let writes = 0;
+    // 换掉 harness 的 persistSnapshot：第 4 次写（第 3 条 move 之后）抛错
+    const organizer = new Organizer({
+      bookmarksApi: h.api,
+      chat: scriptedChat(),
+      persistJob: async () => {},
+      persistSnapshot: async (s) => {
+        writes += 1;
+        if (writes === 4) throw new Error('QUOTA_BYTES exceeded');
+        realPersist.push(s ? structuredClone(s) : null);
+      },
+      settings: settings(),
+    });
+    const saved = structuredClone(h.organizer.state.job);
+    expect(await organizer.restore(saved)).toBe(true);
+
+    await organizer.apply();
+    const { job } = organizer.state;
+    expect(job.phase).toBe('error');
+    expect(job.error).toContain('写入失败，已回滚 3/3');
+    expect(job.error).toContain('QUOTA_BYTES');
+    expect(job.error).not.toContain('未移动任何书签');
+    expect(job.restore).toMatchObject({ reason: 'failure', total: 3, restored: 3 });
+    expect(h.api.dump()).toEqual(original);
+    expect(h.currentSnapshot()).toMatchObject({ status: 'rolled-back', applied: GH.slice(0, 3) });
+  });
+
+  it('[M1] rollback itself failing → error mentions 回滚也失败, snapshot stays applying, no job.restore; the banner path can still recover', async () => {
+    let treeReads = 0;
+    let moves = 0;
+    let failAtRead = -1;
+    const h = harness(4, {
+      wrapApi: (api) => ({
+        getTree: async () => {
+          treeReads += 1;
+          // 失败 move 之后 restoreSnapshot 的第一次读树
+          if (moves === 3 && treeReads === failAtRead) throw new Error('bookmarks service unavailable');
+          return api.getTree();
+        },
+        create: (d) => api.create(d),
+        remove: (id) => api.remove(id),
+        move: async (id, dest) => {
+          moves += 1;
+          if (moves === 3) {
+            failAtRead = treeReads + 1;
+            throw new Error("Can't find bookmark for id bm-gh-2.");
+          }
+          return api.move(id, dest);
+        },
+      }),
+    });
+    const original = await reviewed(h);
+
+    await h.organizer.apply();
+    const { job } = h.organizer.state;
+    expect(job.phase).toBe('error');
+    expect(job.error).toContain('写入失败');
+    expect(job.error).toContain('回滚也失败');
+    expect(job.error).toContain('service unavailable');
+    expect(job.error).toContain('2/30');
+    expect(job.restore).toBeUndefined();
+    expect(job.snapshotId).toBe(h.currentSnapshot()!.id);
+    expect(h.currentSnapshot()).toMatchObject({ status: 'applying', applied: GH.slice(0, 2) });
+    expect(h.api.getNode('bm-gh-0')?.parentId).toBe('other-work'); // 仍在新位置
+
+    // 中断横幅走的路径：对 applying 的 snapshot 回滚
+    const summary = await h.organizer.rollbackInterrupted(h.currentSnapshot()!);
+    expect(summary).toMatchObject({ reason: 'interrupted', total: 2, restored: 2 });
+    expect(h.api.dump()).toEqual(original);
+    expect(h.currentSnapshot()?.status).toBe('rolled-back');
+  });
+
+  it('[Nit] a listener that synchronously calls cancel() on the applying transition takes the stop branch and does not wipe the job', async () => {
+    const h = harness(4);
+    const original = await reviewed(h);
+    let cancelled: Promise<void> | null = null;
+    h.organizer.subscribe(({ job }) => {
+      if (job.phase === 'applying' && cancelled === null) cancelled = h.organizer.cancel();
+    });
+    await h.organizer.apply();
+    await cancelled;
+    const { job } = h.organizer.state;
+    expect(job.phase).toBe('review'); // 备份期间就被取消：没碰书签，回到预览
+    expect(job.proposal).toBeDefined();
+    expect(h.api.calls.move).toBe(0);
+    expect(h.api.dump()).toEqual(original);
+    expect(h.persisted[h.persisted.length - 1]).not.toBeNull();
+  });
+
   it('reset() during applying cancels + rolls back, then clears the job', async () => {
     const gate = deferred();
     let moves = 0;
@@ -417,6 +510,31 @@ describe('rollbackInterrupted (page died mid-apply)', () => {
     expect(organizer.state.job.phase).toBe('idle'); // 不碰 job
   });
 
+  it('[L1] only items[applied.length] is reconciled: a later unapplied item sitting in the target folder is NOT touched', async () => {
+    const { api, snapshot, gId } = await interrupted();
+    // c（items[2]）也在 G 里 —— 但 journal 窗口只有 items[1] = b；c 是用户自己放进去的
+    await api.move('c', { parentId: gId });
+    expect(api.getChildrenIds(gId)).toEqual(['a', 'b', 'c']);
+
+    const reconciled = await reconcileInterruptedJournal(api, snapshot);
+    expect(reconciled.applied).toEqual(['a', 'b']);
+
+    const summary = await rollbackInterruptedSnapshot(api, snapshot, async () => {});
+    expect(summary).toMatchObject({ total: 2, restored: 2, removedFolders: 0, keptFolders: 1 });
+    expect(api.getChildrenIds(gId)).toEqual(['c']); // c 留在 G，G 因非空保留
+    expect(api.getChildrenIds('2')).toEqual(['a', 'b', 'F', gId]);
+  });
+
+  it('[L1] the window item is not reconciled when it is not at toParentId, and a b-in-target with applied=[] still counts (items[0])', async () => {
+    const { api, snapshot, gId } = await interrupted();
+    // b 不在 G（用户挪回去了）→ 不补
+    await api.move('b', { parentId: 'F' });
+    expect((await reconcileInterruptedJournal(api, snapshot)).applied).toEqual(['a']);
+    // applied 为空时窗口是 items[0] = a，它在 G → 补上
+    expect((await reconcileInterruptedJournal(api, { ...snapshot, applied: [] })).applied).toEqual(['a']);
+    expect(api.getNode('a')?.parentId).toBe(gId);
+  });
+
   it('with a plain partial journal (nothing outside applied moved) only the applied subset is restored', async () => {
     const { api, snapshot, gId } = await interrupted();
     // 把 b 挪回去，模拟「只有 a 动过」
@@ -454,13 +572,75 @@ describe('rollbackInterrupted (page died mid-apply)', () => {
 });
 
 describe('restore() and apply-related persistence (M6)', () => {
-  it('discards a job left in applying by a crash (the snapshot banner handles it), clearing storage', async () => {
+  it('[H1] does not restore a job left in applying, and does NOT clear it either (another organize tab may be writing it)', async () => {
     const h = harness(4);
-    const crashed: OrganizeJob = { id: 'j', phase: 'applying', total: 30, done: 12, skipped: [], snapshotId: 'snap-x' };
-    expect(await h.organizer.restore(crashed)).toBe(false);
+    const live: OrganizeJob = { id: 'j', phase: 'applying', total: 30, done: 12, skipped: [], snapshotId: 'snap-x' };
+    expect(await h.organizer.restore(live)).toBe(false);
     expect(h.organizer.state.job.phase).toBe('idle');
-    expect(h.persisted).toEqual([null]);
+    expect(h.persisted).toEqual([]); // 不能 persist(null) 抹掉别的页面正在写的 job
     expect(h.organizer.isRunning).toBe(false);
+
+    // 生成阶段的 job 仍然照旧清掉
+    const midRun: OrganizeJob = { id: 'j2', phase: 'assigning', total: 40, done: 20, skipped: [] };
+    expect(await h.organizer.restore(midRun)).toBe(false);
+    expect(h.persisted).toEqual([null]);
+  });
+
+  it('[M2] restoring a review job skips bookmarks the user filed into a folder meanwhile (parent-changed) and never moves them', async () => {
+    const first = harness(4);
+    await reviewed(first);
+    await first.organizer.flush();
+    const saved = structuredClone(first.persisted[first.persisted.length - 1]!);
+
+    const second = harness(4);
+    // 用户在预览和刷新之间自己把 bm-tb-2 归档到「工作」，bm-news-1 挪到书签栏（另一个根，非 scope）
+    await second.api.move('bm-tb-2', { parentId: 'other-work' });
+    await second.api.move('bm-news-1', { parentId: '1' });
+    expect(await second.organizer.restore(saved)).toBe(true);
+
+    const { job, bookmarks } = second.organizer.state;
+    expect(bookmarks.map((b) => b.id)).not.toContain('bm-tb-2');
+    expect(bookmarks.map((b) => b.id)).not.toContain('bm-news-1');
+    expect(bookmarks).toHaveLength(34);
+    expect(job.skipped).toEqual([
+      { bookmarkId: 'bm-tb-2', reason: 'parent-changed' },
+      { bookmarkId: 'bm-news-1', reason: 'parent-changed' },
+    ]);
+    expect(job.proposal!.assignments.some((a) => a.bookmarkId === 'bm-tb-2' || a.bookmarkId === 'bm-news-1')).toBe(false);
+    const planned = second.organizer.plannedMoves();
+    expect(planned).toHaveLength(28);
+    expect(planned.map((m) => m.bookmarkId)).not.toContain('bm-tb-2');
+
+    await second.organizer.apply();
+    expect(second.organizer.state.job.phase).toBe('done');
+    expect(second.api.getNode('bm-tb-2')?.parentId).toBe('other-work');
+    expect(second.api.getNode('bm-news-1')?.parentId).toBe('1');
+    // 「工作」里：原有 1 条 + 用户放的 tb-2 + 10 条 github（追加）
+    expect(second.api.getChildrenIds('other-work')).toEqual(['bm-in-work', 'bm-tb-2', ...GH]);
+  });
+
+  it('[M3] an apply where every item is skipped does not persist a snapshot: the previous undoable one survives', async () => {
+    const h = harness(4);
+    await reviewed(h);
+    // 假装上一次整理留下的 snapshot 还在存储里
+    const previous: Snapshot = { id: 'snap-previous', createdAt: 1, items: [], createdFolderIds: [], applied: ['bm-bar-1'], status: 'applied' };
+    h.snapshots.push(previous);
+    // 预览后所有计划内的书签都被用户挪走了
+    for (const move of h.organizer.plannedMoves()) await h.api.move(move.bookmarkId, { parentId: 'other-work' });
+
+    await h.organizer.apply();
+    const { job } = h.organizer.state;
+    expect(job.phase).toBe('review');
+    expect(job.error).toContain('没有可移动的书签');
+    expect(job.snapshotId).toBeUndefined();
+    expect(job.skipped).toHaveLength(30);
+    expect(job.skipped.every((s) => s.reason === 'parent-changed')).toBe(true);
+    expect(h.currentSnapshot()).toBe(previous); // 一次都没写
+    expect(h.snapshots).toHaveLength(1);
+    expect(h.backups).toHaveLength(1); // 备份仍然做了（在校验之前）
+    // 没有建过（也没留下）任何新文件夹
+    expect(h.api.calls.create).toBe(0);
+    expect(h.api.getChildrenIds('2').map((id) => h.api.getNode(id)!.title).filter((t) => t === '购物' || t === '资讯')).toEqual([]);
   });
 
   it('restores a done job as-is (result view), without adding skipped entries for bookmarks deleted after apply', async () => {
