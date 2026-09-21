@@ -106,15 +106,29 @@ export type ReviewState = {
   includeDuplicates: boolean;    // 勾选后重复 URL 的条目也按类目移动；默认 false
 };
 
+// 撤销 / 回滚的结果摘要（restoreSnapshot 的计数 + 触发原因），结果页显示「已恢复 N/M」
+export type RestoreSummary = {
+  reason: 'undo' | 'failure' | 'cancel' | 'interrupted';
+  total: number;            // 尝试恢复的条数（= applied 子集大小）
+  restored: number;         // 回到原文件夹
+  skipped: number;          // 书签已被用户删除
+  relocated: number;        // 原文件夹已不存在，移到对应根节点末尾
+  failed: number;           // move 意外失败
+  removedFolders: number;   // 删掉的空新建文件夹
+  keptFolders: number;      // 非空而保留的新建文件夹
+};
+
 export type OrganizeJob = {
   id: string;
   phase: JobPhase;
-  total: number;
-  done: number;
+  total: number;            // applying / done 阶段 = 本次实际要移动的条数
+  done: number;             // applying / done 阶段 = 已成功移动的条数
   proposal?: Proposal;
   snapshotId?: string;
   skipped: Array<{ bookmarkId: string; reason: string }>;   // apply 前校验被剔除的
   error?: string;
   input?: JobInput;
   review?: ReviewState;
+  backupFileName?: string;  // §5.3 第 0 步下载的备份文件名；未备份时为空
+  restore?: RestoreSummary; // 撤销 / 回滚过一次之后有值
 };

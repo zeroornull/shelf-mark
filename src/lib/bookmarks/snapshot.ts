@@ -50,6 +50,13 @@ export type ApplyOptions = {
   id?: string;
   /** 时间源（测试用）。 */
   now?: () => number;
+  /**
+   * 每条 move 之前询问一次（§7「applying：停止后续 move」）：返回 true → 不再 move，
+   * 对 `applied` 子集走与失败相同的回滚路径，结果 `ok: false, stopped: true`。绝不打断正在进行的 move。
+   */
+  shouldStop?: () => boolean;
+  /** 进度：snapshot 落盘后（done = 0）和每成功一条 move 后各调用一次；total = 本次实际要移动的条数。 */
+  onProgress?: (done: number, total: number) => void;
 };
 
 export type RestoreResult = {
@@ -70,15 +77,17 @@ export type RestoreResult = {
 };
 
 export type ApplyResult = {
-  /** true：全部 move 成功，status 'applied'；false：中途失败并已回滚，status 'rolled-back'。 */
+  /** true：全部 move 成功，status 'applied'；false：中途失败 / 被 `shouldStop` 停止并已回滚，status 'rolled-back'。 */
   ok: boolean;
   snapshot: Snapshot;
   /** 应用前校验被剔除的条目（含 same-parent 这种无需移动的）。 */
   skipped: SkippedMove[];
-  /** ok 为 false 时的原始错误。 */
+  /** ok 为 false 且不是 stopped 时的原始错误。 */
   error?: unknown;
   /** ok 为 false 时的回滚结果。 */
   rollback?: RestoreResult;
+  /** true：因 `shouldStop` 返回 true 而停止（不是失败）。 */
+  stopped?: boolean;
 };
 
 /** 通过校验、待解析目标的条目。 */
@@ -247,9 +256,15 @@ export async function applySnapshot(
 
   // 5. 先落盘
   await persist(cloneSnapshot(snapshot));
+  options.onProgress?.(0, items.length);
 
   // 6. 串行 move，不传 index
   for (const item of items) {
+    if (options.shouldStop?.()) {
+      // 调用方要求停止（取消）：不再 move，对 applied 子集走与失败相同的回滚路径
+      const rollback = await restoreSnapshot(api, snapshot, 'rolled-back', persist);
+      return { ok: false, snapshot: rollback.snapshot, skipped, rollback, stopped: true };
+    }
     try {
       await api.move(item.bookmarkId, { parentId: item.toParentId });
     } catch (error) {
@@ -259,6 +274,7 @@ export async function applySnapshot(
     }
     snapshot.applied.push(item.bookmarkId);
     await persist(cloneSnapshot(snapshot));
+    options.onProgress?.(snapshot.applied.length, items.length);
   }
 
   // 7. 全部成功

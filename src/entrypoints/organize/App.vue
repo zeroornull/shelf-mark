@@ -1,5 +1,5 @@
 <script lang="ts" setup>
-import { computed, ref, watch } from 'vue';
+import { computed, onBeforeUnmount, ref, watch } from 'vue';
 import { browser } from 'wxt/browser';
 import DomainHistogram from '@/components/DomainHistogram.vue';
 import JobProgress from '@/components/JobProgress.vue';
@@ -8,14 +8,19 @@ import SeedCategoriesInput from '@/components/SeedCategoriesInput.vue';
 import { useBookmarkTree } from '@/composables/useBookmarkTree';
 import { useOrganizeJob } from '@/composables/useOrganizeJob';
 import { useSettings } from '@/composables/useSettings';
+import { useSnapshotRecovery } from '@/composables/useSnapshotRecovery';
 import { domainHistogram, findDuplicates } from '@/lib/ai/sampling';
-import { RUNNING_PHASES } from '@/lib/jobs/organizer';
+import { describeBookmarkError, describeSkipReason } from '@/lib/bookmarks/errors';
 import { listReusableFolders, selectBookmarksInScope, type RootInfo } from '@/lib/bookmarks/tree';
+import { RUNNING_PHASES } from '@/lib/jobs/organizer';
+import { describeRestoreSummary, restoreAnomalies } from '@/lib/jobs/recovery';
 
 const { tree, loading: treeLoading, error: treeError, reload } = useBookmarkTree();
 const { settings, loaded: settingsLoaded, hasApiKey, flush } = useSettings();
 const organize = useOrganizeJob(settings);
 const { job, bookmarks: jobBookmarks, existingFolders: jobFolders, restoring, organizer } = organize;
+// 持久化 snapshot 的响应式视图：驱动「上次整理被中断」横幅和撤销按钮的可用性（本页就是 organize 页，不用探测自己）
+const recovery = useSnapshotRecovery(undefined, { trackOrganizePage: false });
 
 // ------------------------------------------------------------------ wizard steps
 
@@ -23,13 +28,16 @@ type Step = 1 | 2 | 3 | 4;
 const step = ref<Step>(1);
 const phase = computed(() => job.value.phase);
 const running = computed(() => RUNNING_PHASES.has(phase.value));
+const applying = computed(() => phase.value === 'applying');
+/** apply 阶段失败 / 取消（proposal 仍在）：留在结果页展示回滚信息，而不是回到第 1 步。 */
+const applyFailed = computed(() => phase.value === 'error' && job.value.proposal !== undefined);
 
 watch(
   phase,
   (next) => {
-    if (RUNNING_PHASES.has(next)) step.value = 2;
+    if (next === 'applying' || next === 'done' || applyFailed.value) step.value = 4;
+    else if (RUNNING_PHASES.has(next)) step.value = 2;
     else if (next === 'review') step.value = 3;
-    else if (next === 'applying' || next === 'done') step.value = 4;
     else step.value = 1;
   },
   { immediate: true },
@@ -39,8 +47,60 @@ const STEPS: Array<{ n: Step; label: string }> = [
   { n: 1, label: '范围确认' },
   { n: 2, label: '生成中' },
   { n: 3, label: '预览' },
-  { n: 4, label: '结果' },
+  { n: 4, label: '应用与结果' },
 ];
+
+// ------------------------------------------------------------------ §5.3 中断保护：applying 期间挂 beforeunload
+
+function onBeforeUnload(event: BeforeUnloadEvent): void {
+  event.preventDefault();
+  event.returnValue = '';
+}
+watch(
+  applying,
+  (active) => {
+    if (active) window.addEventListener('beforeunload', onBeforeUnload);
+    else window.removeEventListener('beforeunload', onBeforeUnload);
+  },
+  { immediate: true },
+);
+onBeforeUnmount(() => window.removeEventListener('beforeunload', onBeforeUnload));
+
+// ------------------------------------------------------------------ 中断横幅：上次 apply 没跑完（snapshot 仍是 applying）
+
+const showInterrupted = computed(() => recovery.interrupted.value && !applying.value && !restoring.value);
+const rollbackBusy = ref(false);
+const rollbackNote = ref<{ ok: boolean; text: string } | null>(null);
+
+async function rollbackInterrupted(): Promise<void> {
+  const snapshot = recovery.snapshot.value;
+  if (!snapshot || rollbackBusy.value) return;
+  if (!window.confirm(`回滚被中断的整理，把已移动的 ${snapshot.applied.length} 条书签移回原位置？`)) return;
+  rollbackBusy.value = true;
+  rollbackNote.value = null;
+  try {
+    const summary = await organize.rollbackInterrupted(snapshot);
+    rollbackNote.value = { ok: true, text: `上次整理已回滚，${describeRestoreSummary(summary, '恢复')}` };
+    void reload();
+  } catch (e) {
+    rollbackNote.value = { ok: false, text: describeBookmarkError(e) };
+  } finally {
+    rollbackBusy.value = false;
+  }
+}
+
+// ------------------------------------------------------------------ 顶部错误条
+
+/** error 阶段的文案在第 4 步自己展示；其余阶段附带的提示（例如备份失败回到 review）显示在这里。 */
+const bannerError = computed(() => {
+  if (phase.value === 'error') return step.value === 4 ? null : (job.value.error ?? '未知错误');
+  return job.value.error ?? null;
+});
+
+function dismissError(): void {
+  if (phase.value === 'error') void organize.reset();
+  else organize.clearError();
+}
 
 // ------------------------------------------------------------------ step 1: scope
 
@@ -136,24 +196,93 @@ async function discard(): Promise<void> {
 
 const excludedCount = computed(() => job.value.review?.excluded.length ?? 0);
 
-// ------------------------------------------------------------------ step 4: result (round 3)
+// ------------------------------------------------------------------ step 4: apply
 
 // 读一下 proposal / review，编辑后才会重新计算（organizer 内部状态本身不是响应式的）
-const plannedMoves = computed(() => (job.value.phase === 'review' && job.value.proposal && job.value.review ? organize.plannedMoves() : []));
+const plannedMoves = computed(() => (phase.value === 'review' && job.value.proposal && job.value.review ? organize.plannedMoves() : []));
 const plannedFolders = computed(() => {
   const paths = new Set<string>();
   for (const move of plannedMoves.value) if ('toPath' in move) paths.add(move.toPath.join(' / '));
   return [...paths];
 });
+const applyBusy = ref(false);
 const applyNote = ref<string | null>(null);
 
 async function apply(): Promise<void> {
-  if (!window.confirm(`将移动 ${plannedMoves.value.length} 条书签、新建最多 ${plannedFolders.value.length} 个文件夹。继续？`)) return;
+  if (applyBusy.value || plannedMoves.value.length === 0) return;
+  const backupNote = settings.value.autoBackup ? '应用前会先下载一份 HTML 备份。' : '注意：已在设置中关闭自动备份。';
+  if (!window.confirm(`将移动 ${plannedMoves.value.length} 条书签、新建最多 ${plannedFolders.value.length} 个文件夹。${backupNote}\n继续？`)) return;
+  applyBusy.value = true;
+  applyNote.value = null;
   try {
-    await organizer.apply();
+    await organize.apply();
   } catch (e) {
-    applyNote.value = e instanceof Error ? e.message : String(e);
+    applyNote.value = describeBookmarkError(e);
+  } finally {
+    applyBusy.value = false;
   }
+}
+
+/** applying 阶段的取消 = 停止后续 move 并回滚已移动的（§7），本身就是危险操作，也要确认。 */
+async function cancelApply(): Promise<void> {
+  if (cancelling.value) return;
+  if (!window.confirm(`停止应用，并把已移动的 ${job.value.done} 条书签移回原位置？`)) return;
+  cancelling.value = true;
+  try {
+    await organize.cancel();
+  } finally {
+    cancelling.value = false;
+  }
+}
+
+// ------------------------------------------------------------------ step 4: result / undo
+
+const skippedRows = computed(() => {
+  const titles = new Map(jobBookmarks.value.map((b) => [b.id, b.title]));
+  return job.value.skipped.map((s) => ({ ...s, title: titles.get(s.bookmarkId) ?? s.bookmarkId, text: describeSkipReason(s.reason) }));
+});
+
+/** 当前持久化的 snapshot 是否就是本次 apply 产生的那份。 */
+const snapshotMatches = computed(() => job.value.snapshotId !== undefined && recovery.snapshot.value?.id === job.value.snapshotId);
+const snapshotStatus = computed(() => (snapshotMatches.value ? recovery.snapshot.value?.status : undefined));
+const undoBusy = ref(false);
+const undoNote = ref<string | null>(null);
+const canUndo = computed(() => phase.value === 'done' && snapshotStatus.value === 'applied' && !undoBusy.value && !job.value.restore);
+
+async function undo(): Promise<void> {
+  if (!canUndo.value) return;
+  if (!window.confirm(`撤销这次整理，把 ${job.value.done} 条书签移回原位置？\n新建的空文件夹会被删除，里面有你手动添加内容的会保留。`)) return;
+  undoBusy.value = true;
+  undoNote.value = null;
+  try {
+    await organize.undo();
+    void reload();
+  } catch (e) {
+    undoNote.value = describeBookmarkError(e);
+  } finally {
+    undoBusy.value = false;
+  }
+}
+
+async function backToReview(): Promise<void> {
+  try {
+    await organize.backToReview();
+  } catch (e) {
+    applyNote.value = describeBookmarkError(e);
+  }
+}
+
+/** 再次整理：清掉 job（snapshot 保留，仍可在 sidepanel 撤销），回到第 1 步并重读树。 */
+async function startOver(): Promise<void> {
+  await organize.reset();
+  applyNote.value = null;
+  undoNote.value = null;
+  void reload();
+}
+
+async function finish(): Promise<void> {
+  await organize.reset();
+  window.close();
 }
 
 function openOptions(): void {
@@ -180,15 +309,38 @@ function openOptions(): void {
       <button type="button" class="text-xs text-gray-500 underline" @click="openOptions">设置</button>
     </header>
 
+    <!-- 上次整理被中断（snapshot 仍是 applying）：先回滚 -->
+    <section v-if="showInterrupted && recovery.snapshot.value" class="space-y-2 rounded border border-amber-300 bg-amber-50 px-3 py-2 text-amber-900">
+      <p class="flex flex-wrap items-center justify-between gap-2">
+        <span>
+          上次整理被中断，已移动 <span class="font-medium tabular-nums">{{ recovery.appliedCount.value }}/{{ recovery.totalCount.value }}</span>
+          条书签。建议先回滚到整理前的状态，再开始新的整理。
+        </span>
+        <button
+          type="button"
+          class="rounded border border-amber-400 bg-white px-3 py-1 hover:bg-amber-100 disabled:opacity-50"
+          :disabled="rollbackBusy"
+          @click="rollbackInterrupted"
+        >
+          {{ rollbackBusy ? '回滚中…' : '回滚' }}
+        </button>
+      </p>
+      <p v-if="rollbackNote && !rollbackNote.ok" class="text-xs text-red-700">{{ rollbackNote.text }}</p>
+    </section>
+    <p v-else-if="rollbackNote?.ok" class="flex items-center justify-between gap-2 rounded border border-green-300 bg-green-50 px-3 py-2 text-green-800">
+      <span>{{ rollbackNote.text }}</span>
+      <button type="button" class="text-xs underline" @click="rollbackNote = null">关闭</button>
+    </p>
+
     <p v-if="settingsLoaded && !hasApiKey" class="rounded border border-amber-300 bg-amber-50 px-3 py-2 text-amber-800">
       未配置 Key，无法开始整理。
       <button type="button" class="underline" @click="openOptions">去设置</button>
     </p>
 
-    <p v-if="phase === 'error'" class="flex flex-wrap items-center justify-between gap-2 rounded border border-red-300 bg-red-50 px-3 py-2 text-red-800">
-      <span>出错：{{ job.error }}</span>
+    <p v-if="bannerError" class="flex flex-wrap items-center justify-between gap-2 rounded border border-red-300 bg-red-50 px-3 py-2 text-red-800">
+      <span>{{ phase === 'error' ? '出错：' : '' }}{{ bannerError }}</span>
       <span class="flex gap-2 text-xs">
-        <button type="button" class="underline" @click="organize.reset()">清除</button>
+        <button type="button" class="underline" @click="dismissError">清除</button>
       </span>
     </p>
 
@@ -248,7 +400,7 @@ function openOptions(): void {
           >
             开始生成
           </button>
-          <p class="text-xs text-gray-500">生成阶段只读书签、只发脱敏后的标题与网址；预览确认后才会移动任何书签。</p>
+          <p class="text-xs text-gray-500">生成阶段只读书签、只发脱敏后的标题与网址；预览确认后才会移动任何书签。这里改的类目 / 偏好会保存为默认值。</p>
         </div>
       </div>
     </section>
@@ -312,31 +464,117 @@ function openOptions(): void {
       </div>
     </section>
 
-    <!-- 4 · 结果（第 3 轮接 applySnapshot） -->
+    <!-- 4 · 应用与结果 -->
     <section v-else-if="step === 4" class="space-y-4 rounded border border-gray-200 p-4">
       <h2 class="font-semibold">4 · 应用与结果</h2>
-      <div class="text-xs text-gray-600">
-        <p>将移动 <span class="font-medium text-gray-800">{{ plannedMoves.length }}</span> 条书签；按路径新建 / 复用文件夹 {{ plannedFolders.length }} 个：</p>
-        <ul class="mt-1 flex flex-wrap gap-1">
-          <li v-for="path in plannedFolders" :key="path" class="rounded bg-gray-100 px-2 py-0.5">{{ path }}</li>
-        </ul>
-        <p v-if="settings.autoBackup" class="mt-2">应用前会自动下载 HTML 备份。</p>
-      </div>
-      <p class="rounded border border-dashed border-gray-300 px-3 py-2 text-xs text-gray-500">
-        写入（备份 → snapshot 落盘 → 串行移动 → 撤销栏）在第 3 轮接入；这一步目前只做确认，不会改动书签。
-      </p>
-      <p v-if="applyNote" class="rounded border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-800">{{ applyNote }}</p>
-      <div class="flex gap-2">
-        <button type="button" class="rounded border border-gray-300 px-3 py-1.5 hover:bg-gray-50" @click="step = 3">返回预览</button>
-        <button
-          type="button"
-          class="rounded bg-gray-900 px-3 py-1.5 text-white hover:bg-gray-700 disabled:cursor-not-allowed disabled:opacity-50"
-          :disabled="plannedMoves.length === 0"
-          @click="apply"
-        >
-          应用（第 3 轮）
-        </button>
-      </div>
+
+      <!-- 4a · 应用前确认 -->
+      <template v-if="phase === 'review'">
+        <div class="text-xs text-gray-600">
+          <p>将移动 <span class="font-medium text-gray-800">{{ plannedMoves.length }}</span> 条书签；按路径新建 / 复用文件夹 {{ plannedFolders.length }} 个：</p>
+          <ul class="mt-1 flex flex-wrap gap-1">
+            <li v-for="path in plannedFolders" :key="path" class="rounded bg-gray-100 px-2 py-0.5">{{ path }}</li>
+          </ul>
+          <p class="mt-2">
+            <template v-if="settings.autoBackup">应用前会自动下载 HTML 备份（可在 Chrome 书签管理器里导入）。</template>
+            <template v-else><span class="text-amber-700">已在设置中关闭自动备份。</span></template>
+            应用过程中请不要关闭此页；应用完成后可一键撤销。
+          </p>
+        </div>
+        <p v-if="applyNote" class="rounded border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-800">{{ applyNote }}</p>
+        <div class="flex gap-2">
+          <button type="button" class="rounded border border-gray-300 px-3 py-1.5 hover:bg-gray-50" :disabled="applyBusy" @click="step = 3">返回预览</button>
+          <button
+            type="button"
+            class="rounded bg-gray-900 px-3 py-1.5 text-white hover:bg-gray-700 disabled:cursor-not-allowed disabled:opacity-50"
+            :disabled="plannedMoves.length === 0 || applyBusy"
+            @click="apply"
+          >
+            {{ applyBusy ? '应用中…' : '应用' }}
+          </button>
+        </div>
+      </template>
+
+      <!-- 4b · 应用中 -->
+      <template v-else-if="phase === 'applying'">
+        <JobProgress :phase="phase" :done="job.done" :total="job.total" :cancelling="cancelling" @cancel="cancelApply" />
+        <p class="text-xs text-gray-600">
+          <template v-if="job.backupFileName">已下载备份：<span class="font-mono">{{ job.backupFileName }}</span>。</template>
+          正在串行移动书签，每移动一条都会记入日志；请不要关闭此页。取消会停在下一条之前，并把已移动的书签移回原位置。
+        </p>
+      </template>
+
+      <!-- 4c · 完成 -->
+      <template v-else-if="phase === 'done'">
+        <div class="space-y-1 text-xs text-gray-700">
+          <p class="text-sm text-gray-900">
+            已移动 <span class="font-medium">{{ job.done }}</span> 条书签
+            <span v-if="skippedRows.length > 0">，跳过 {{ skippedRows.length }} 条</span>。
+          </p>
+          <p>
+            <template v-if="job.backupFileName">已下载备份：<span class="font-mono">{{ job.backupFileName }}</span></template>
+            <template v-else-if="settings.autoBackup">未备份</template>
+            <template v-else>未备份（已在设置中关闭）</template>
+          </p>
+        </div>
+
+        <details v-if="skippedRows.length > 0" class="text-xs">
+          <summary class="cursor-pointer text-gray-600">跳过的 {{ skippedRows.length }} 条（未移动）</summary>
+          <ul class="mt-1 space-y-0.5 text-gray-600">
+            <li v-for="row in skippedRows" :key="row.bookmarkId">
+              <span class="text-gray-800">{{ row.title }}</span> — {{ row.text }}
+            </li>
+          </ul>
+        </details>
+
+        <p v-if="job.restore" class="rounded border border-green-300 bg-green-50 px-3 py-2 text-xs text-green-800">
+          {{ describeRestoreSummary(job.restore, '已恢复') }}
+        </p>
+        <p v-else-if="snapshotStatus === 'undone'" class="rounded border border-gray-200 bg-gray-50 px-3 py-2 text-xs text-gray-600">
+          这次整理已在其他页面撤销。
+        </p>
+        <p v-else-if="snapshotStatus === undefined && recovery.loaded.value" class="rounded border border-gray-200 bg-gray-50 px-3 py-2 text-xs text-gray-600">
+          找不到这次整理的 snapshot（可能已被新的整理覆盖），无法在这里撤销。
+        </p>
+        <p v-if="undoNote" class="rounded border border-red-300 bg-red-50 px-3 py-2 text-xs text-red-800">{{ undoNote }}</p>
+
+        <div class="flex flex-wrap gap-2">
+          <button
+            type="button"
+            class="rounded border border-red-300 px-3 py-1.5 text-red-700 hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-50"
+            :disabled="!canUndo"
+            @click="undo"
+          >
+            {{ undoBusy ? '撤销中…' : '撤销' }}
+          </button>
+          <button type="button" class="rounded border border-gray-300 px-3 py-1.5 hover:bg-gray-50" @click="startOver">再次整理</button>
+          <button type="button" class="rounded bg-gray-900 px-3 py-1.5 text-white hover:bg-gray-700" @click="finish">完成</button>
+        </div>
+      </template>
+
+      <!-- 4d · 失败 / 取消（已回滚） -->
+      <template v-else-if="applyFailed">
+        <p class="rounded border border-red-300 bg-red-50 px-3 py-2 text-red-800">{{ job.error }}</p>
+        <div class="space-y-1 text-xs text-gray-700">
+          <p v-if="job.restore">
+            尚未移动的 {{ job.total - job.done }} 条书签保持原状<template v-for="text in restoreAnomalies(job.restore)" :key="text">；{{ text }}</template>。
+          </p>
+          <p v-if="job.backupFileName">已下载备份：<span class="font-mono">{{ job.backupFileName }}</span></p>
+        </div>
+        <details v-if="skippedRows.length > 0" class="text-xs">
+          <summary class="cursor-pointer text-gray-600">校验时跳过的 {{ skippedRows.length }} 条</summary>
+          <ul class="mt-1 space-y-0.5 text-gray-600">
+            <li v-for="row in skippedRows" :key="row.bookmarkId">
+              <span class="text-gray-800">{{ row.title }}</span> — {{ row.text }}
+            </li>
+          </ul>
+        </details>
+        <p v-if="applyNote" class="rounded border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-800">{{ applyNote }}</p>
+        <div class="flex flex-wrap gap-2">
+          <button type="button" class="rounded border border-gray-300 px-3 py-1.5 hover:bg-gray-50" @click="backToReview">返回预览</button>
+          <button type="button" class="rounded border border-gray-300 px-3 py-1.5 hover:bg-gray-50" @click="startOver">再次整理</button>
+        </div>
+      </template>
     </section>
 
     <section v-else class="rounded border border-gray-200 p-4 text-xs text-gray-500">正在恢复上次的预览…</section>

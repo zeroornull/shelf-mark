@@ -1,13 +1,14 @@
 import { computed, onScopeDispose, ref, shallowRef, watch, type Ref } from 'vue';
 import { createChatFn, type ChatFn } from '@/lib/ai/client';
-import { createChromeBookmarksApi } from '@/lib/bookmarks/api';
+import { createChromeBookmarksApi, type BookmarkTreeNode } from '@/lib/bookmarks/api';
+import { backupFileName, downloadBackup, renderNetscapeHtml } from '@/lib/bookmarks/backup';
 import { Organizer, type OrganizerState } from '@/lib/jobs/organizer';
-import { jobStorage, persistJobToStorage } from '@/lib/jobs/store';
-import type { JobInput, Settings } from '@/lib/types';
+import { jobStorage, loadSnapshotFromStorage, persistJobToStorage, persistSnapshotToStorage } from '@/lib/jobs/store';
+import type { JobInput, Settings, Snapshot } from '@/lib/types';
 
 /**
- * 把 `Organizer` 接到真实环境：Chrome 书签 API、真实 `chatJson`、`local:job`、当前设置。
- * 页面加载时从 `local:job` 恢复（review 阶段不重打模型）。
+ * 把 `Organizer` 接到真实环境：Chrome 书签 API、真实 `chatJson`、`local:job` / `local:snapshot`、
+ * 真实 HTML 备份（渲染 + `<a download>`）、当前设置。页面加载时从 `local:job` 恢复（review 阶段不重打模型）。
  */
 export function useOrganizeJob(settings: Ref<Settings>) {
   // provider 变了就换一个 client（quirks 是按 provider 记的）
@@ -19,10 +20,20 @@ export function useOrganizeJob(settings: Ref<Settings>) {
     },
   );
 
+  /** §5.3 第 0 步 / §5.4：渲染 Netscape HTML 并触发下载，返回文件名。 */
+  const backup = async (tree: BookmarkTreeNode[]): Promise<string> => {
+    const fileName = backupFileName();
+    downloadBackup(renderNetscapeHtml(tree), fileName);
+    return fileName;
+  };
+
   const organizer = new Organizer({
     bookmarksApi: createChromeBookmarksApi(),
     chat: (args) => chat(args),
     persistJob: persistJobToStorage,
+    persistSnapshot: persistSnapshotToStorage,
+    loadSnapshot: loadSnapshotFromStorage,
+    backup,
     settings: () => settings.value,
   });
 
@@ -63,5 +74,10 @@ export function useOrganizeJob(settings: Ref<Settings>) {
     cancel: () => organizer.cancel(),
     reset: () => organizer.reset(),
     plannedMoves: () => organizer.plannedMoves(),
+    apply: () => organizer.apply(),
+    undo: (snapshot?: Snapshot) => organizer.undo(snapshot),
+    rollbackInterrupted: (snapshot: Snapshot) => organizer.rollbackInterrupted(snapshot),
+    backToReview: () => organizer.backToReview(),
+    clearError: () => organizer.clearError(),
   };
 }

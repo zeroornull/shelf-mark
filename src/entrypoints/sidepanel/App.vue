@@ -2,12 +2,14 @@
 import { computed, ref } from 'vue';
 import { browser } from 'wxt/browser';
 import BookmarkTree from '@/components/BookmarkTree.vue';
+import UndoBar from '@/components/UndoBar.vue';
 import { useBookmarkTree } from '@/composables/useBookmarkTree';
 import { useHostPermission } from '@/composables/useHostPermission';
 import { useSettings } from '@/composables/useSettings';
 import type { RootInfo } from '@/lib/bookmarks/tree';
 
-const { tree, loading, error, reload, looseByRoot, totalBookmarks } = useBookmarkTree();
+// live：书签有任何变化（整理页 apply / 撤销、用户手动改）都会防抖刷新树
+const { tree, loading, error, reload, looseByRoot, totalBookmarks } = useBookmarkTree({ live: true });
 const filter = ref('');
 
 const { settings, loaded: settingsLoaded, hasApiKey } = useSettings();
@@ -78,6 +80,8 @@ function openOptions(): void {
         </p>
       </template>
     </section>
+
+    <UndoBar @changed="reload" />
 
     <section class="border-b border-gray-200 px-3 py-2 text-xs text-gray-600">
       <p v-if="loading">正在读取书签…</p>

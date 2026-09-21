@@ -2,8 +2,9 @@ import { assignBookmarks, selectWeakAssignments, shouldRefine } from '../ai/assi
 import { AiError, describeAiError, type ChatFn } from '../ai/client';
 import { detectLanguage, findDuplicates } from '../ai/sampling';
 import { proposeTaxonomy, refineTaxonomy } from '../ai/taxonomy';
-import type { BookmarksApi } from '../bookmarks/api';
-import type { PlannedMove } from '../bookmarks/snapshot';
+import type { BookmarksApi, BookmarkTreeNode } from '../bookmarks/api';
+import { describeBookmarkError } from '../bookmarks/errors';
+import { applySnapshot, type ApplyResult, type PlannedMove } from '../bookmarks/snapshot';
 import {
   listReusableFolders,
   readBookmarkTree,
@@ -12,19 +13,23 @@ import {
   type ReusableFolder,
   type RootInfo,
 } from '../bookmarks/tree';
-import type { FlatBookmark, JobInput, OrganizeJob, Proposal, ReviewState, Settings } from '../types';
+import type { FlatBookmark, JobInput, OrganizeJob, Proposal, RestoreSummary, ReviewState, Settings, Snapshot } from '../types';
+import { rollbackInterruptedSnapshot, summarizeRestore, undoSnapshot } from './recovery';
 import { resolveMoves } from './resolve';
 import * as review from './review';
 
 /**
  * 整理状态机（计划 §7），跑在 organize 页，不跑在 background。
  *
- * idle → loading-tree → proposing → assigning → (refining) → review → [applying → done：第 3 轮接 applySnapshot]
- *                                                             ↘ error（任何阶段失败，job.error = describeAiError）
+ * idle → loading-tree → proposing → assigning → (refining) → review → applying → done
+ *                                                             ↘ error（任何阶段失败；apply 失败 / 取消时已回滚）
  *
- * - 所有外部依赖注入：`bookmarksApi` / `chat` / `persistJob` / `settings` / `now`，单测用 fake api + 脚本化 chat
- * - 每次 phase 变化、每批 assign 完成后 `persistJob`；刷新页面用 `restore()` 回到 review，不重打模型
- * - `cancel()`：abort 在途请求，丢弃部分结果，回到 idle，不写任何书签；review 之前本类从不调用 create / move / remove
+ * - 所有外部依赖注入：`bookmarksApi` / `chat` / `persistJob` / `persistSnapshot` / `backup` / `settings` / `now`，
+ *   单测用 fake api + 脚本化 chat + 记录器
+ * - 每次 phase 变化、每批 assign 完成、每条 move 完成后 `persistJob`；刷新页面用 `restore()` 回到 review，不重打模型
+ * - `cancel()`：生成阶段 abort 在途请求、丢弃部分结果、回到 idle；applying 阶段不打断正在进行的 move，
+ *   在下一条之前停下并对 `applied` 子集回滚（§7），结果是 `error` + 「已取消，已回滚 N/M」
+ * - review 之前本类从不调用 create / move / remove；`apply()` 之后写入全部走 `applySnapshot`（备份 → snapshot 落盘 → 串行 move）
  * - review 编辑是 `./review` 里的纯函数，这里只做「应用 + 持久化 + 通知」
  */
 
@@ -33,6 +38,12 @@ export type OrganizerDeps = {
   chat: ChatFn;
   /** null → 清掉持久化的 job。 */
   persistJob: (job: OrganizeJob | null) => Promise<void>;
+  /** snapshot / journal 落盘（apply 每条 move 后一次，undo / 回滚后一次）；null → 清掉。 */
+  persistSnapshot: (snapshot: Snapshot | null) => Promise<void>;
+  /** 读当前持久化的 snapshot（`undo()` 不传参时用）。 */
+  loadSnapshot?: () => Promise<Snapshot | null>;
+  /** §5.3 第 0 步：生成并下载 HTML 备份，返回文件名。`settings.autoBackup` 为 false 时不会调用。 */
+  backup?: (tree: BookmarkTreeNode[]) => Promise<string>;
   settings: Settings | (() => Settings);
   now?: () => number;
   /** 生成 job id（测试用）。 */
@@ -50,8 +61,11 @@ export type OrganizerState = {
 
 export type OrganizerListener = (state: OrganizerState) => void;
 
-/** 正在打模型 / 读树的阶段；这些阶段刷新页面后不可恢复，直接丢弃。 */
-export const RUNNING_PHASES: ReadonlySet<OrganizeJob['phase']> = new Set(['loading-tree', 'proposing', 'assigning', 'refining']);
+/**
+ * 正在读树 / 打模型 / 写书签的阶段；这些阶段刷新页面后不可恢复，`restore()` 直接丢弃。
+ * 被中断的 `applying` 不通过 job 恢复，而是由持久化的 snapshot（`status: 'applying'`）驱动回滚横幅（§5.3）。
+ */
+export const RUNNING_PHASES: ReadonlySet<OrganizeJob['phase']> = new Set(['loading-tree', 'proposing', 'assigning', 'refining', 'applying']);
 
 export function createIdleJob(id = 'idle'): OrganizeJob {
   return { id, phase: 'idle', total: 0, done: 0, skipped: [] };
@@ -65,6 +79,10 @@ export class Organizer {
   private controller: AbortController | null = null;
   private runToken = 0;
   private persistQueue: Promise<void> = Promise.resolve();
+  /** 在途的 apply；`cancel()` 在 applying 阶段等它（含回滚）结束。 */
+  private applying: Promise<void> | null = null;
+  /** `applySnapshot` 的 `shouldStop` 读它：true → 下一条 move 之前停下并回滚。 */
+  private stopRequested = false;
   private readonly listeners = new Set<OrganizerListener>();
 
   constructor(private readonly deps: OrganizerDeps) {}
@@ -144,8 +162,19 @@ export class Organizer {
     await this.execute((token, signal) => this.generate(token, signal, settings, input));
   }
 
-  /** 取消：abort 在途请求，丢弃部分结果，回到 idle；不写任何书签。 */
+  /**
+   * 取消。
+   * - 生成阶段：abort 在途请求，丢弃部分结果，回到 idle；不写任何书签。
+   * - applying 阶段（§7）：不打断正在进行的 move；置停止标志，`applySnapshot` 在下一条之前停下并对 `applied`
+   *   子集回滚，本方法等回滚结束才返回。结果 phase 是 `error`，`job.error` = 「已取消，已回滚 N/M」，
+   *   `job.restore.reason === 'cancel'`；proposal 仍在，可 `backToReview()` 后再次应用。
+   */
   async cancel(): Promise<void> {
+    if (this.job.phase === 'applying' && this.applying) {
+      this.stopRequested = true;
+      await this.applying;
+      return;
+    }
     this.runToken += 1;
     this.controller?.abort();
     this.controller = null;
@@ -154,14 +183,20 @@ export class Organizer {
     await this.persist(null);
   }
 
-  /** 回到 idle 并清掉持久化的 job（review 之后放弃、或 error 后重来）。 */
+  /** 回到 idle 并清掉持久化的 job（review 之后放弃、done / error 后重来）。applying 阶段会先取消并回滚。 */
   async reset(): Promise<void> {
     await this.cancel();
+    if (this.job.phase !== 'idle') {
+      this.job = createIdleJob();
+      this.emit();
+      await this.persist(null);
+    }
   }
 
   /**
-   * 页面加载时恢复持久化的 job。review / done / error / applying 原样恢复（review 会重新读树 join 出书签，
-   * 不重打模型）；正在运行中的阶段没法续跑，直接丢弃并清掉存储。返回是否恢复了一个 job。
+   * 页面加载时恢复持久化的 job。review / done / error 原样恢复（有 proposal 时重新读树 join 出书签，
+   * 不重打模型）；正在运行中的阶段（含 applying）没法续跑，直接丢弃并清掉存储——被中断的 apply 由持久化的
+   * snapshot 驱动回滚横幅，不当作可恢复的 job。返回是否恢复了一个 job。
    */
   async restore(saved: OrganizeJob | null): Promise<boolean> {
     if (!saved || saved.phase === 'idle' || RUNNING_PHASES.has(saved.phase)) {
@@ -182,7 +217,8 @@ export class Organizer {
         else missing.push(assignment.bookmarkId);
       }
       this.bookmarks = bookmarks;
-      if (missing.length > 0) {
+      // 只有 review 才把消失的书签剔出计划；done / error 是历史结果，原样展示
+      if (saved.phase === 'review' && missing.length > 0) {
         const gone = new Set(missing);
         this.job = {
           ...saved,
@@ -196,9 +232,82 @@ export class Organizer {
     return true;
   }
 
-  /** 第 3 轮接 `applySnapshot`（备份 → snapshot 落盘 → 串行 move → done）。 */
-  apply(): Promise<never> {
-    return Promise.reject(new Error('Organizer.apply() is not implemented in this round (round 3 wires applySnapshot).'));
+  // ---------------------------------------------------------------- apply / undo / rollback
+
+  /**
+   * 应用（§5.3）：review → applying → done | error。
+   *
+   * 0. `settings.autoBackup` → `backup(tree)`，文件名记到 `job.backupFileName`；备份失败则回到 review，不碰书签
+   * 1–8. `applySnapshot`：校验（变了的进 `job.skipped`）→ 建文件夹 → snapshot 以 'applying' 落盘 → 串行 move + journal
+   *   - 全部成功 → `done`，`job.snapshotId`，`done / total` = 移动条数
+   *   - 第 k 条失败 → 已回滚，`error` + 「写入失败，已回滚 N/M：原因」，`job.restore.reason === 'failure'`
+   *   - `cancel()` → 已回滚，`error` + 「已取消，已回滚 N/M」，`job.restore.reason === 'cancel'`
+   * 前置条件不满足（不在 review、没有可移动的条目）直接 reject，不改状态。
+   */
+  async apply(): Promise<void> {
+    if (this.job.phase !== 'review' || !this.job.proposal) throw new Error('只能在预览阶段应用。');
+    if (this.applying) throw new Error('正在应用中。');
+    const moves = this.plannedMoves();
+    if (moves.length === 0) throw new Error('没有需要移动的书签。');
+
+    const token = ++this.runToken;
+    this.stopRequested = false;
+    const run = this.runApply(token, this.settings(), moves);
+    this.applying = run;
+    try {
+      await run;
+    } finally {
+      if (this.applying === run) this.applying = null;
+    }
+  }
+
+  /**
+   * 撤销最近一次整理：要求 phase 为 done、snapshot `status: 'applied'` 且 id 与本次 job 一致。
+   * 结果记到 `job.restore`（phase 仍是 done；UI 据 snapshot 状态禁用撤销按钮）。
+   */
+  async undo(snapshot?: Snapshot): Promise<RestoreSummary> {
+    if (this.job.phase !== 'done') throw new Error('当前没有可撤销的整理。');
+    const current = snapshot ?? (await this.deps.loadSnapshot?.()) ?? null;
+    if (!current) throw new Error('没有可撤销的 snapshot。');
+    if (this.job.snapshotId !== undefined && current.id !== this.job.snapshotId) {
+      throw new Error('snapshot 与本次整理不匹配（可能已在其他页面重新整理过）。');
+    }
+    const summary = await undoSnapshot(this.deps.bookmarksApi, current, (s) => this.deps.persistSnapshot(s));
+    await this.commit({ restore: summary });
+    return summary;
+  }
+
+  /**
+   * 页面死在 apply 中途后的回滚（§5.3「中断保护」）：对 `status: 'applying'` 的 snapshot 恢复 `applied` 子集
+   * （含 move 成功但 journal 未落盘的那一条），状态 → 'rolled-back'。不改 job（中断的 job 已在 restore 时丢弃）。
+   */
+  async rollbackInterrupted(snapshot: Snapshot): Promise<RestoreSummary> {
+    if (this.job.phase === 'applying') throw new Error('正在应用中，不能回滚。');
+    return rollbackInterruptedSnapshot(this.deps.bookmarksApi, snapshot, (s) => this.deps.persistSnapshot(s));
+  }
+
+  /** apply 失败 / 取消并回滚之后回到预览（proposal 仍在），可以改完再次应用。 */
+  async backToReview(): Promise<void> {
+    if (this.job.phase !== 'error' || !this.job.proposal) throw new Error('当前没有可返回的预览。');
+    await this.commit({
+      phase: 'review',
+      error: undefined,
+      restore: undefined,
+      snapshotId: undefined,
+      backupFileName: undefined,
+      done: this.bookmarks.length,
+      total: this.bookmarks.length,
+      review: this.job.review ?? review.defaultReviewState(),
+      skipped: this.job.skipped.filter((s) => s.reason === 'missing'),
+    });
+  }
+
+  /** 清掉非 error 阶段附带的提示文案（例如备份失败后回到 review）；error 阶段请用 `reset()`。 */
+  clearError(): void {
+    if (this.job.phase === 'error' || this.job.error === undefined) return;
+    this.job = { ...this.job, error: undefined };
+    this.emit();
+    void this.persist(this.job);
   }
 
   // ---------------------------------------------------------------- review edits
@@ -298,6 +407,68 @@ export class Organizer {
     } finally {
       if (this.controller === controller) this.controller = null;
     }
+  }
+
+  private async runApply(token: number, settings: Settings, moves: PlannedMove[]): Promise<void> {
+    const api = this.deps.bookmarksApi;
+    await this.commit(
+      { phase: 'applying', done: 0, total: moves.length, error: undefined, snapshotId: undefined, backupFileName: undefined, restore: undefined },
+      token,
+    );
+
+    // 第 0 步：备份。失败就不碰书签，回到 review
+    if (settings.autoBackup && this.deps.backup) {
+      let fileName: string;
+      try {
+        fileName = await this.deps.backup(await api.getTree());
+      } catch (error) {
+        await this.commit({ phase: 'review', error: `备份失败，未改动任何书签：${describeBookmarkError(error)}` }, token);
+        return;
+      }
+      await this.commit({ backupFileName: fileName }, token);
+    }
+    if (this.stopRequested) {
+      // 备份期间被取消：还没碰书签，直接回到 review
+      await this.commit({ phase: 'review' }, token);
+      return;
+    }
+
+    // 第 1–8 步
+    let result: ApplyResult;
+    try {
+      result = await applySnapshot(api, moves, {
+        persist: (snapshot) => this.deps.persistSnapshot(snapshot),
+        now: this.deps.now,
+        shouldStop: () => this.stopRequested,
+        onProgress: (done, total) => this.progress(token, done, total),
+      });
+    } catch (error) {
+      // 校验 / 建文件夹阶段抛错：applySnapshot 已收回新建的空文件夹，没 move 任何书签、也没落盘 snapshot
+      await this.commit({ phase: 'error', error: `写入失败，未移动任何书签：${describeBookmarkError(error)}` }, token);
+      return;
+    }
+
+    const skipped = [...this.job.skipped, ...result.skipped];
+    const counts = { done: result.snapshot.applied.length, total: result.snapshot.items.length };
+    if (result.ok) {
+      await this.commit({ phase: 'done', snapshotId: result.snapshot.id, skipped, ...counts }, token);
+      return;
+    }
+
+    const restore = result.rollback ? summarizeRestore(result.rollback, result.stopped ? 'cancel' : 'failure') : undefined;
+    const ratio = restore ? `${restore.restored}/${restore.total}` : '0/0';
+    const error = result.stopped
+      ? `已取消，已回滚 ${ratio}`
+      : `写入失败，已回滚 ${ratio}：${describeBookmarkError(result.error)}`;
+    await this.commit({ phase: 'error', error, snapshotId: result.snapshot.id, skipped, restore, ...counts }, token);
+  }
+
+  /** applying 阶段的进度（moves done / total）。 */
+  private progress(token: number, done: number, total: number): void {
+    if (token !== this.runToken) return;
+    this.job = { ...this.job, done, total };
+    this.emit();
+    void this.persist(this.job);
   }
 
   private async generate(token: number, signal: AbortSignal, settings: Settings, input: JobInput): Promise<void> {

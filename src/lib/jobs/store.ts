@@ -15,3 +15,13 @@ export async function persistJobToStorage(job: OrganizeJob | null): Promise<void
   if (job === null) await jobStorage.removeValue();
   else await jobStorage.setValue(job);
 }
+
+/** snapshot / journal 落盘（`applySnapshot` 每条 move 后调用一次）；null → 清掉。 */
+export async function persistSnapshotToStorage(snapshot: Snapshot | null): Promise<void> {
+  if (snapshot === null) await snapshotStorage.removeValue();
+  else await snapshotStorage.setValue(snapshot);
+}
+
+export function loadSnapshotFromStorage(): Promise<Snapshot | null> {
+  return snapshotStorage.getValue();
+}
