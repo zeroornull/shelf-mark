@@ -93,6 +93,19 @@ export type JobPhase =
   | 'done'
   | 'error';
 
+// 步骤 1 确认的输入；刷新恢复与「带提示重新生成」用（scope / maxDepth 等仍取自 settings）
+export type JobInput = {
+  seedCategories: string[];
+  userHint: string;
+};
+
+// review 阶段的人工编辑，随 job 一起落盘
+export type ReviewState = {
+  excluded: string[];            // 用户剔除的 bookmarkId，不移动
+  includeUncategorized: boolean; // 勾选后 uncategorized 条目移入「未分类」文件夹；默认 false
+  includeDuplicates: boolean;    // 勾选后重复 URL 的条目也按类目移动；默认 false
+};
+
 export type OrganizeJob = {
   id: string;
   phase: JobPhase;
@@ -102,4 +115,6 @@ export type OrganizeJob = {
   snapshotId?: string;
   skipped: Array<{ bookmarkId: string; reason: string }>;   // apply 前校验被剔除的
   error?: string;
+  input?: JobInput;
+  review?: ReviewState;
 };

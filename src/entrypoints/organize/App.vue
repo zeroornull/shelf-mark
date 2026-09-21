@@ -2,19 +2,48 @@
 import { computed, ref, watch } from 'vue';
 import { browser } from 'wxt/browser';
 import DomainHistogram from '@/components/DomainHistogram.vue';
+import JobProgress from '@/components/JobProgress.vue';
+import ProposalPreview from '@/components/ProposalPreview.vue';
 import SeedCategoriesInput from '@/components/SeedCategoriesInput.vue';
 import { useBookmarkTree } from '@/composables/useBookmarkTree';
+import { useOrganizeJob } from '@/composables/useOrganizeJob';
 import { useSettings } from '@/composables/useSettings';
-import { createChatFn, describeAiError } from '@/lib/ai/client';
-import { detectLanguage, domainHistogram, findDuplicates } from '@/lib/ai/sampling';
-import { proposeTaxonomy } from '@/lib/ai/taxonomy';
+import { domainHistogram, findDuplicates } from '@/lib/ai/sampling';
+import { RUNNING_PHASES } from '@/lib/jobs/organizer';
 import { listReusableFolders, selectBookmarksInScope, type RootInfo } from '@/lib/bookmarks/tree';
-import type { Category } from '@/lib/types';
 
 const { tree, loading: treeLoading, error: treeError, reload } = useBookmarkTree();
 const { settings, loaded: settingsLoaded, hasApiKey, flush } = useSettings();
+const organize = useOrganizeJob(settings);
+const { job, bookmarks: jobBookmarks, existingFolders: jobFolders, restoring, organizer } = organize;
 
-/** 第 1 步：范围确认。整理范围按 settings.scope / debugLimit 选，与将来 organizer 里的选择一致。 */
+// ------------------------------------------------------------------ wizard steps
+
+type Step = 1 | 2 | 3 | 4;
+const step = ref<Step>(1);
+const phase = computed(() => job.value.phase);
+const running = computed(() => RUNNING_PHASES.has(phase.value));
+
+watch(
+  phase,
+  (next) => {
+    if (RUNNING_PHASES.has(next)) step.value = 2;
+    else if (next === 'review') step.value = 3;
+    else if (next === 'applying' || next === 'done') step.value = 4;
+    else step.value = 1;
+  },
+  { immediate: true },
+);
+
+const STEPS: Array<{ n: Step; label: string }> = [
+  { n: 1, label: '范围确认' },
+  { n: 2, label: '生成中' },
+  { n: 3, label: '预览' },
+  { n: 4, label: '结果' },
+];
+
+// ------------------------------------------------------------------ step 1: scope
+
 const inScope = computed(() =>
   tree.value ? selectBookmarksInScope(tree.value, settings.value.scope, settings.value.debugLimit) : [],
 );
@@ -40,11 +69,11 @@ function rootLabel(root: RootInfo): string {
 const histogram = computed(() => domainHistogram(inScope.value));
 const duplicates = computed(() => findDuplicates(inScope.value));
 
-/** 可复用文件夹（各根合并，SeedCategoriesInput 会按标题去重）。 */
-const existingFolders = computed(() =>
-  tree.value ? scopeRoots.value.flatMap((root) => listReusableFolders(tree.value!, root.id)) : [],
+const seedSuggestions = computed(() =>
+  tree.value
+    ? scopeRoots.value.flatMap((root) => listReusableFolders(tree.value!, root.id)).map((f) => ({ title: f.title, path: f.path }))
+    : [],
 );
-const seedSuggestions = computed(() => existingFolders.value.map((f) => ({ title: f.title, path: f.path })));
 
 const seeds = ref<string[]>([]);
 const hint = ref('');
@@ -59,58 +88,73 @@ watch(
 );
 
 const canStart = computed(
-  () => settingsLoaded.value && hasApiKey.value && !treeLoading.value && inScope.value.length > 0 && !generating.value,
+  () => settingsLoaded.value && hasApiKey.value && !treeLoading.value && inScope.value.length > 0 && !running.value && !restoring.value,
 );
 
-// M3：只跑 propose，把类目列出来（归类 / 预览 / 状态机在 M4 接入）
-const generating = ref(false);
-const generateError = ref<string | null>(null);
-const categories = ref<Category[] | null>(null);
-
 async function startGenerate(): Promise<void> {
-  if (!canStart.value || !tree.value) return;
-  generating.value = true;
-  generateError.value = null;
-  categories.value = null;
-  try {
-    settings.value.seedCategories = [...seeds.value];
-    settings.value.userHint = hint.value;
-    await flush();
+  if (!canStart.value) return;
+  // 记住这次的 seeds / hint，下次打开还是这些
+  settings.value.seedCategories = [...seeds.value];
+  settings.value.userHint = hint.value;
+  await flush();
+  await organize.start({ seedCategories: seeds.value, userHint: hint.value });
+}
 
-    const language =
-      settings.value.language === 'auto' ? detectLanguage(inScope.value.map((b) => b.title)) : settings.value.language;
-    const result = await proposeTaxonomy(
-      {
-        bookmarks: inScope.value,
-        existingFolders: existingFolders.value,
-        seedCategories: seeds.value,
-        userHint: hint.value,
-        maxDepth: settings.value.maxDepth,
-        language,
-      },
-      { chat: createChatFn(settings.value.provider) },
-    );
-    categories.value = result.categories;
-  } catch (e) {
-    generateError.value = describeAiError(e);
+// ------------------------------------------------------------------ step 2: progress
+
+const cancelling = ref(false);
+async function cancel(): Promise<void> {
+  cancelling.value = true;
+  try {
+    await organize.cancel();
   } finally {
-    generating.value = false;
+    cancelling.value = false;
   }
 }
 
-const categoryTree = computed(() => {
-  const list = categories.value ?? [];
-  const children = new Map<string, Category[]>();
-  for (const c of list) {
-    if (c.parentId === undefined) continue;
-    const bucket = children.get(c.parentId) ?? [];
-    bucket.push(c);
-    children.set(c.parentId, bucket);
-  }
-  return list.filter((c) => c.parentId === undefined).map((c) => ({ category: c, children: children.get(c.id) ?? [] }));
-});
+// ------------------------------------------------------------------ step 3: review
 
-const folderTitleById = computed(() => new Map(existingFolders.value.map((f) => [f.id, f.path.join(' / ')])));
+const regenerateHint = ref('');
+watch(
+  () => job.value.input?.userHint,
+  (value) => {
+    regenerateHint.value = value ?? '';
+  },
+  { immediate: true },
+);
+
+async function regenerate(): Promise<void> {
+  if (running.value) return;
+  await organize.regenerate(regenerateHint.value.trim());
+}
+
+async function discard(): Promise<void> {
+  if (!window.confirm('放弃这次生成的结果？（不会改动任何书签）')) return;
+  await organize.reset();
+  void reload();
+}
+
+const excludedCount = computed(() => job.value.review?.excluded.length ?? 0);
+
+// ------------------------------------------------------------------ step 4: result (round 3)
+
+// 读一下 proposal / review，编辑后才会重新计算（organizer 内部状态本身不是响应式的）
+const plannedMoves = computed(() => (job.value.phase === 'review' && job.value.proposal && job.value.review ? organize.plannedMoves() : []));
+const plannedFolders = computed(() => {
+  const paths = new Set<string>();
+  for (const move of plannedMoves.value) if ('toPath' in move) paths.add(move.toPath.join(' / '));
+  return [...paths];
+});
+const applyNote = ref<string | null>(null);
+
+async function apply(): Promise<void> {
+  if (!window.confirm(`将移动 ${plannedMoves.value.length} 条书签、新建最多 ${plannedFolders.value.length} 个文件夹。继续？`)) return;
+  try {
+    await organizer.apply();
+  } catch (e) {
+    applyNote.value = e instanceof Error ? e.message : String(e);
+  }
+}
 
 function openOptions(): void {
   void browser.runtime.openOptionsPage();
@@ -118,9 +162,21 @@ function openOptions(): void {
 </script>
 
 <template>
-  <main class="mx-auto max-w-5xl space-y-6 p-6 text-sm text-gray-800">
-    <header class="flex items-baseline justify-between">
+  <main class="mx-auto max-w-6xl space-y-5 p-6 text-sm text-gray-800">
+    <header class="flex flex-wrap items-center justify-between gap-3">
       <h1 class="text-lg font-semibold">Shelfmark 整理</h1>
+      <ol class="flex items-center gap-2 text-xs">
+        <li v-for="s in STEPS" :key="s.n" class="flex items-center gap-2">
+          <span
+            class="flex h-5 w-5 items-center justify-center rounded-full"
+            :class="step === s.n ? 'bg-gray-900 text-white' : step > s.n ? 'bg-gray-300 text-gray-700' : 'bg-gray-100 text-gray-400'"
+          >
+            {{ s.n }}
+          </span>
+          <span :class="step === s.n ? 'font-medium text-gray-900' : 'text-gray-500'">{{ s.label }}</span>
+          <span v-if="s.n < 4" class="text-gray-300">—</span>
+        </li>
+      </ol>
       <button type="button" class="text-xs text-gray-500 underline" @click="openOptions">设置</button>
     </header>
 
@@ -129,11 +185,19 @@ function openOptions(): void {
       <button type="button" class="underline" @click="openOptions">去设置</button>
     </p>
 
-    <section class="space-y-4 rounded border border-gray-200 p-4">
+    <p v-if="phase === 'error'" class="flex flex-wrap items-center justify-between gap-2 rounded border border-red-300 bg-red-50 px-3 py-2 text-red-800">
+      <span>出错：{{ job.error }}</span>
+      <span class="flex gap-2 text-xs">
+        <button type="button" class="underline" @click="organize.reset()">清除</button>
+      </span>
+    </p>
+
+    <!-- 1 · 范围确认 -->
+    <section v-if="step === 1" class="space-y-4 rounded border border-gray-200 p-4">
       <h2 class="font-semibold">1 · 范围确认</h2>
 
       <div class="text-xs text-gray-600">
-        <p v-if="treeLoading">正在读取书签…</p>
+        <p v-if="treeLoading || restoring">正在读取书签…</p>
         <p v-else-if="treeError" class="text-red-600">
           读取书签失败：{{ treeError }}
           <button type="button" class="ml-2 underline" @click="reload">重试</button>
@@ -164,7 +228,7 @@ function openOptions(): void {
         <div class="space-y-3">
           <div>
             <h3 class="mb-1 text-xs font-medium text-gray-600">预填顶层类目（seedCategories）</h3>
-            <SeedCategoriesInput v-model="seeds" :suggestions="seedSuggestions" :disabled="generating" />
+            <SeedCategoriesInput v-model="seeds" :suggestions="seedSuggestions" :disabled="running" />
           </div>
           <div>
             <h3 class="mb-1 text-xs font-medium text-gray-600">一句话偏好（userHint）</h3>
@@ -173,7 +237,7 @@ function openOptions(): void {
               rows="3"
               class="w-full rounded border border-gray-300 px-2 py-1"
               placeholder="例：不要按编程语言分；把购物类合并成一个"
-              :disabled="generating"
+              :disabled="running"
             />
           </div>
           <button
@@ -182,30 +246,99 @@ function openOptions(): void {
             :disabled="!canStart"
             @click="startGenerate"
           >
-            {{ generating ? '生成中…' : '开始生成' }}
+            开始生成
           </button>
+          <p class="text-xs text-gray-500">生成阶段只读书签、只发脱敏后的标题与网址；预览确认后才会移动任何书签。</p>
         </div>
       </div>
     </section>
 
-    <section v-if="generateError || categories" class="space-y-3 rounded border border-gray-200 p-4">
-      <h2 class="font-semibold">类目预览</h2>
-      <p v-if="generateError" class="rounded border border-red-300 bg-red-50 px-3 py-2 text-xs text-red-800">{{ generateError }}</p>
-      <ul v-else class="space-y-1">
-        <li v-for="{ category, children } in categoryTree" :key="category.id">
-          <span class="font-medium">{{ category.title }}</span>
-          <span class="ml-1 text-xs text-gray-400">{{ category.id }}</span>
-          <span v-if="category.existingFolderId" class="ml-1 rounded bg-blue-50 px-1 text-xs text-blue-700" :title="folderTitleById.get(category.existingFolderId)">复用已有</span>
-          <ul v-if="children.length > 0" class="ml-4 mt-0.5 space-y-0.5">
-            <li v-for="child in children" :key="child.id">
-              {{ child.title }}
-              <span class="ml-1 text-xs text-gray-400">{{ child.id }}</span>
-              <span v-if="child.existingFolderId" class="ml-1 rounded bg-blue-50 px-1 text-xs text-blue-700">复用已有</span>
-            </li>
-          </ul>
-        </li>
-      </ul>
-      <p v-if="categories" class="text-xs text-gray-500">共 {{ categories.length }} 个类目。批量归类与预览编辑在下一步接入。</p>
+    <!-- 2 · 生成中 -->
+    <section v-else-if="step === 2" class="space-y-4 rounded border border-gray-200 p-4">
+      <h2 class="font-semibold">2 · 生成中</h2>
+      <JobProgress :phase="phase" :done="job.done" :total="job.total" :cancelling="cancelling" @cancel="cancel" />
+      <p class="text-xs text-gray-500">
+        propose → 分批 assign（每批 {{ settings.batchSize }} 条，{{ settings.concurrency }} 路并发）→ 未分类过多时补一轮类目。取消会丢弃未完成的批次，不写书签。
+      </p>
     </section>
+
+    <!-- 3 · 预览 -->
+    <section v-else-if="step === 3 && job.proposal && job.review" class="space-y-4 rounded border border-gray-200 p-4">
+      <div class="flex flex-wrap items-center justify-between gap-2">
+        <h2 class="font-semibold">3 · 预览</h2>
+        <p class="text-xs text-gray-500">
+          {{ job.proposal.categories.length }} 个类目 · {{ jobBookmarks.length }} 条书签
+          <span v-if="excludedCount > 0"> · 已剔除 {{ excludedCount }}</span>
+          <span v-if="job.proposal.warnings.unknownCategory + job.proposal.warnings.missingIndex > 0" class="text-amber-700">
+            · 模型输出兜底 {{ job.proposal.warnings.unknownCategory + job.proposal.warnings.missingIndex }} 条
+          </span>
+          <span v-if="job.skipped.length > 0" class="text-amber-700"> · {{ job.skipped.length }} 条书签已不存在</span>
+        </p>
+      </div>
+
+      <ProposalPreview
+        :proposal="job.proposal"
+        :bookmarks="jobBookmarks"
+        :review="job.review"
+        :existing-folders="jobFolders"
+        @set-category="(id, c) => organizer.setCategory(id, c)"
+        @merge="(from, into) => organizer.mergeCategories(from, into)"
+        @rename="(id, title) => organizer.renameCategory(id, title)"
+        @exclude="(id) => organizer.excludeBookmark(id)"
+        @include="(id) => organizer.includeBookmark(id)"
+        @include-uncategorized="(v) => organizer.setIncludeUncategorized(v)"
+        @include-duplicates="(v) => organizer.setIncludeDuplicates(v)"
+      />
+
+      <div class="flex flex-wrap items-end justify-between gap-3 border-t border-gray-200 pt-3">
+        <div class="min-w-[16rem] flex-1 space-y-1">
+          <label class="text-xs text-gray-600" for="regenerate-hint">带提示重新生成（会丢掉当前预览的手动修改）</label>
+          <div class="flex gap-2">
+            <input
+              id="regenerate-hint"
+              v-model="regenerateHint"
+              type="text"
+              class="min-w-0 flex-1 rounded border border-gray-300 px-2 py-1"
+              placeholder="例：把购物和生活合并；不要按编程语言分"
+              @keydown.enter.prevent="regenerate"
+            />
+            <button type="button" class="rounded border border-gray-300 px-3 py-1 hover:bg-gray-50" @click="regenerate">重新生成</button>
+          </div>
+        </div>
+        <div class="flex gap-2">
+          <button type="button" class="rounded border border-gray-300 px-3 py-1.5 hover:bg-gray-50" @click="discard">放弃</button>
+          <button type="button" class="rounded bg-gray-900 px-3 py-1.5 text-white hover:bg-gray-700" @click="step = 4">下一步：应用</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- 4 · 结果（第 3 轮接 applySnapshot） -->
+    <section v-else-if="step === 4" class="space-y-4 rounded border border-gray-200 p-4">
+      <h2 class="font-semibold">4 · 应用与结果</h2>
+      <div class="text-xs text-gray-600">
+        <p>将移动 <span class="font-medium text-gray-800">{{ plannedMoves.length }}</span> 条书签；按路径新建 / 复用文件夹 {{ plannedFolders.length }} 个：</p>
+        <ul class="mt-1 flex flex-wrap gap-1">
+          <li v-for="path in plannedFolders" :key="path" class="rounded bg-gray-100 px-2 py-0.5">{{ path }}</li>
+        </ul>
+        <p v-if="settings.autoBackup" class="mt-2">应用前会自动下载 HTML 备份。</p>
+      </div>
+      <p class="rounded border border-dashed border-gray-300 px-3 py-2 text-xs text-gray-500">
+        写入（备份 → snapshot 落盘 → 串行移动 → 撤销栏）在第 3 轮接入；这一步目前只做确认，不会改动书签。
+      </p>
+      <p v-if="applyNote" class="rounded border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-800">{{ applyNote }}</p>
+      <div class="flex gap-2">
+        <button type="button" class="rounded border border-gray-300 px-3 py-1.5 hover:bg-gray-50" @click="step = 3">返回预览</button>
+        <button
+          type="button"
+          class="rounded bg-gray-900 px-3 py-1.5 text-white hover:bg-gray-700 disabled:cursor-not-allowed disabled:opacity-50"
+          :disabled="plannedMoves.length === 0"
+          @click="apply"
+        >
+          应用（第 3 轮）
+        </button>
+      </div>
+    </section>
+
+    <section v-else class="rounded border border-gray-200 p-4 text-xs text-gray-500">正在恢复上次的预览…</section>
   </main>
 </template>
