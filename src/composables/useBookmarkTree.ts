@@ -2,6 +2,7 @@ import { computed, onScopeDispose, ref, shallowRef } from 'vue';
 import { browser } from 'wxt/browser';
 import type { BookmarksApi } from '@/lib/bookmarks/api';
 import { createChromeBookmarksApi } from '@/lib/bookmarks/api';
+import { describeBookmarkError } from '@/lib/bookmarks/errors';
 import type { BookmarkTree } from '@/lib/bookmarks/tree';
 import { countLooseByRoot, readBookmarkTree } from '@/lib/bookmarks/tree';
 
@@ -25,7 +26,7 @@ export function useBookmarkTree(options: UseBookmarkTreeOptions = {}, api: Bookm
     try {
       tree.value = await readBookmarkTree(api);
     } catch (e) {
-      error.value = e instanceof Error ? e.message : String(e);
+      error.value = describeBookmarkError(e);
     } finally {
       loading.value = false;
     }

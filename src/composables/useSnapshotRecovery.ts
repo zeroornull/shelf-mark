@@ -41,6 +41,11 @@ export function useSnapshotRecovery(
   }
 
   const unwatch = snapshotStorage.watch((value) => {
+    if (value?.id !== snapshot.value?.id) {
+      // 换了一份 snapshot（新的整理）：上一轮的结果 / 错误不再相关
+      lastSummary.value = null;
+      error.value = null;
+    }
     snapshot.value = value;
   });
   onScopeDispose(unwatch);
@@ -55,6 +60,7 @@ export function useSnapshotRecovery(
     (active) => {
       if (recheck !== undefined) clearInterval(recheck);
       recheck = undefined;
+      organizeOpen.value = null;
       if (!active || options.trackOrganizePage === false) return;
       void checkOrganizeOpen();
       recheck = setInterval(() => void checkOrganizeOpen(), options.recheckMs ?? 3000);
@@ -97,9 +103,8 @@ export function useSnapshotRecovery(
 /** 是否有 organize 页（tab）打开着；`runtime.getContexts` 不可用时当作没有（宁可多给一个回滚按钮）。 */
 export async function isOrganizePageOpen(): Promise<boolean> {
   try {
-    const getContexts = browser.runtime.getContexts;
-    if (typeof getContexts !== 'function') return false;
-    const contexts = await getContexts({ contextTypes: ['TAB'], documentUrls: [browser.runtime.getURL('/organize.html')] });
+    if (typeof browser.runtime.getContexts !== 'function') return false;
+    const contexts = await browser.runtime.getContexts({ contextTypes: ['TAB'], documentUrls: [browser.runtime.getURL('/organize.html')] });
     return contexts.length > 0;
   } catch {
     return false;
