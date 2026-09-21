@@ -1,5 +1,6 @@
 import { computed, onScopeDispose, ref, toRaw, watch } from 'vue';
-import { settingsStorage } from '@/lib/settings';
+import { toPlain } from '@/lib/plain';
+import { persistSettings, settingsStorage } from '@/lib/settings';
 import type { Settings } from '@/lib/types';
 
 /**
@@ -42,13 +43,13 @@ export function useSettings(options: { debounceMs?: number } = {}) {
       clearTimeout(timer);
       timer = undefined;
     }
-    const value = structuredClone(toRaw(settings.value));
+    const value = toPlain(toRaw(settings.value));
     const json = JSON.stringify(value);
     if (json === lastSynced) return;
     lastSynced = json;
     saving.value = true;
     try {
-      await settingsStorage.setValue(value);
+      await persistSettings(value);
       error.value = null;
     } catch (e) {
       error.value = e instanceof Error ? e.message : String(e);

@@ -1,4 +1,5 @@
 import { storage } from 'wxt/utils/storage';
+import { toPlain } from './plain';
 import type { Settings } from './types';
 
 // API Key 只进 storage.local，绝不 sync。
@@ -21,3 +22,8 @@ export const settingsStorage = storage.defineItem<Settings>('local:settings', {
     userHint: '',
   },
 });
+
+/** 落盘前压成纯 JSON，避免 Vue Proxy 让 `setValue` 内部的 `structuredClone` 抛错。 */
+export async function persistSettings(value: Settings): Promise<void> {
+  await settingsStorage.setValue(toPlain(value));
+}

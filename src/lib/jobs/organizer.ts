@@ -14,6 +14,7 @@ import {
   type ReusableFolder,
   type RootInfo,
 } from '../bookmarks/tree';
+import { toPlain } from '../plain';
 import type { BookmarkOrigin, FlatBookmark, JobInput, OrganizeJob, Proposal, RestoreSummary, ReviewState, Settings, Snapshot } from '../types';
 import { rollbackInterruptedSnapshot, summarizeRestore, undoSnapshot } from './recovery';
 import { resolveMoves } from './resolve';
@@ -418,7 +419,7 @@ export class Organizer {
 
   private persist(job: OrganizeJob | null): Promise<void> {
     // 串行化：进度写入很密，不能让旧值覆盖新值
-    const snapshot = job === null ? null : structuredClone(job);
+    const snapshot = job === null ? null : toPlain(job);
     this.persistQueue = this.persistQueue.then(() => this.deps.persistJob(snapshot)).catch((error) => {
       console.debug('[shelfmark] persistJob failed', error instanceof Error ? error.message : String(error));
     });

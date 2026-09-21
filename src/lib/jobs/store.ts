@@ -1,4 +1,5 @@
 import { storage } from 'wxt/utils/storage';
+import { toPlain } from '../plain';
 import type { OrganizeJob, Snapshot } from '../types';
 
 /**
@@ -13,13 +14,13 @@ export const snapshotStorage = storage.defineItem<Snapshot | null>('local:snapsh
 /** 给 organizer 注入用：null → 清掉。 */
 export async function persistJobToStorage(job: OrganizeJob | null): Promise<void> {
   if (job === null) await jobStorage.removeValue();
-  else await jobStorage.setValue(job);
+  else await jobStorage.setValue(toPlain(job));
 }
 
 /** snapshot / journal 落盘（`applySnapshot` 每条 move 后调用一次）；null → 清掉。 */
 export async function persistSnapshotToStorage(snapshot: Snapshot | null): Promise<void> {
   if (snapshot === null) await snapshotStorage.removeValue();
-  else await snapshotStorage.setValue(snapshot);
+  else await snapshotStorage.setValue(toPlain(snapshot));
 }
 
 export function loadSnapshotFromStorage(): Promise<Snapshot | null> {

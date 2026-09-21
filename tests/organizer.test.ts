@@ -1,3 +1,4 @@
+import { reactive } from 'vue';
 import { describe, expect, it } from 'vitest';
 import { AiError, type ChatFn } from '../src/lib/ai/client';
 import { ASSIGN_SYSTEM, PROPOSE_SYSTEM, REFINE_SYSTEM } from '../src/lib/ai/prompts';
@@ -71,6 +72,15 @@ describe('Organizer – happy path', () => {
     expect(organizer.state.job.error).toContain('未配置 Key');
     expect(record).toHaveLength(0);
     expect(persisted[persisted.length - 1]?.phase).toBe('error');
+  });
+
+  it('persists when seedCategories comes from a Vue-reactive Settings object', async () => {
+    const { organizer, persisted } = harness(4, { settings: reactive(settings()) });
+    await organizer.start();
+    await organizer.flush();
+    expect(organizer.state.job.phase).toBe('review');
+    expect(persisted[0]?.input?.seedCategories).toEqual(['生活']);
+    expect(() => structuredClone(persisted[0])).not.toThrow();
   });
 
   it('errors when the scope has no loose bookmarks', async () => {
