@@ -51,6 +51,7 @@ export function useOrganizeJob(settings: Ref<Settings>) {
   const job = computed(() => state.value.job);
   const bookmarks = computed(() => state.value.bookmarks);
   const existingFolders = computed(() => state.value.existingFolders);
+  const roots = computed(() => state.value.roots);
   const isRunning = computed(() => organizer.isRunning);
 
   const restoring = ref(true);
@@ -71,6 +72,7 @@ export function useOrganizeJob(settings: Ref<Settings>) {
     job,
     bookmarks,
     existingFolders,
+    roots,
     isRunning,
     restoring,
     restoredFromStorage,

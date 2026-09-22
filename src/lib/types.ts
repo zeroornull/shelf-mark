@@ -10,6 +10,7 @@ export type Settings = {
   provider: ProviderConfig;
   scope: 'loose-other' | 'loose-bar-and-other';   // 'selected' 放 V1.1
   includeFoldered: boolean;   // 已在文件夹里的书签也进整理范围，默认 true
+  domainMinCount: number;     // 按域名建夹的门槛；整理页固定为 1（每个网站一个夹）
   maxDepth: 1 | 2;
   batchSize: number;          // 默认 30
   concurrency: 1 | 2 | 3;     // assign 批次并发，默认 2
@@ -102,10 +103,15 @@ export type JobPhase =
   | 'error';
 
 // 步骤 1 确认的输入；刷新恢复与「带提示重新生成」用（scope / maxDepth 等仍取自 settings）
+export type OrganizeMode = 'ai' | 'domain';
+
 export type JobInput = {
   seedCategories: string[];
   userHint: string;
   includeFoldered?: boolean;
+  mode?: OrganizeMode;          // 默认 ai；domain = 按 eTLD+1 建夹，不打模型
+  domainMinCount?: number;
+  keepThematic?: boolean;       // 已在非域名主题夹里的默认不按域名拆出，默认 true
 };
 
 // review 阶段的人工编辑，随 job 一起落盘
@@ -144,4 +150,22 @@ export type OrganizeJob = {
   origins?: Record<string, BookmarkOrigin>;
   /** 应用后变空的、非本次新建的用户文件夹（只报告，绝不自动删除）。 */
   emptiedFolders?: Array<{ id: string; path: string[] }>;
+  /** 实际写入的移动（刷新结果页仍能看「从哪到哪」）。 */
+  moveReport?: MoveReportItem[];
+  /** 应用时未勾选、保持原位的条目。 */
+  heldBack?: HeldBackItem[];
+};
+
+export type MoveReportItem = {
+  bookmarkId: string;
+  title: string;
+  url: string;
+  fromPath: string[];
+  toPath: string[];
+};
+
+export type HeldBackItem = {
+  bookmarkId: string;
+  title: string;
+  destLabel: string;
 };

@@ -14,9 +14,11 @@ import {
   type ReusableFolder,
   type RootInfo,
 } from '../bookmarks/tree';
+import { proposeByDomain } from '../domain-sort';
 import { toPlain } from '../plain';
 import type { BookmarkOrigin, FlatBookmark, JobInput, OrganizeJob, Proposal, RestoreSummary, ReviewState, Settings, Snapshot } from '../types';
 import { rollbackInterruptedSnapshot, summarizeRestore, undoSnapshot } from './recovery';
+import { buildHeldBack, buildMoveReport } from './move-report';
 import { resolveMoves } from './resolve';
 import * as review from './review';
 
@@ -125,17 +127,21 @@ export class Organizer {
     if (this.isRunning) throw new Error('Organizer is already running.');
     const settings = this.settings();
     const includeFoldered = input.includeFoldered ?? settings.includeFoldered ?? true;
+    const mode = input.mode ?? 'ai';
     const jobInput: JobInput = {
       seedCategories: input.seedCategories ?? settings.seedCategories,
       userHint: input.userHint ?? settings.userHint,
       includeFoldered,
+      mode,
+      domainMinCount: input.domainMinCount ?? settings.domainMinCount,
+      keepThematic: input.keepThematic ?? true,
     };
     this.job = { ...createIdleJob(this.newId()), input: jobInput };
     this.bookmarks = [];
     this.tree = null;
     this.existingFolders = [];
 
-    if (settings.provider.apiKey.trim() === '') {
+    if (mode === 'ai' && settings.provider.apiKey.trim() === '') {
       await this.commit({ phase: 'error', error: '未配置 Key：先在设置页填写 apiKey 并测试连接' });
       return;
     }
@@ -151,7 +157,8 @@ export class Organizer {
       if (this.bookmarks.length === 0) {
         throw new Error('整理范围内没有书签');
       }
-      await this.generate(token, signal, settings, jobInput);
+      if (mode === 'domain') await this.generateDomain(token, settings, jobInput);
+      else await this.generate(token, signal, settings, jobInput);
     });
   }
 
@@ -162,6 +169,9 @@ export class Organizer {
       seedCategories: this.job.input?.seedCategories ?? this.settings().seedCategories,
       userHint,
       includeFoldered: this.job.input?.includeFoldered ?? this.settings().includeFoldered ?? true,
+      mode: this.job.input?.mode ?? 'ai',
+      domainMinCount: this.job.input?.domainMinCount ?? this.settings().domainMinCount,
+      keepThematic: this.job.input?.keepThematic ?? true,
     };
     if (this.bookmarks.length === 0 || this.tree === null) {
       await this.start(input);
@@ -169,7 +179,11 @@ export class Organizer {
     }
     const settings = this.settings();
     this.job = { ...this.job, input, proposal: undefined, review: undefined, error: undefined, skipped: [] };
-    await this.execute((token, signal) => this.generate(token, signal, settings, input));
+    await this.execute((token, signal) =>
+      input.mode === 'domain'
+        ? this.generateDomain(token, settings, input)
+        : this.generate(token, signal, settings, input),
+    );
   }
 
   /**
@@ -510,7 +524,25 @@ export class Organizer {
         result.snapshot.items.map((item) => item.fromParentId),
         new Set(result.snapshot.createdFolderIds),
       );
-      await this.commit({ phase: 'done', snapshotId: result.snapshot.id, skipped, emptiedFolders, ...counts }, token);
+      const rootByFolder = new Map(this.existingFolders.map((f) => [f.id, f.rootId]));
+      const heldBack = this.job.proposal
+        ? buildHeldBack({
+            proposal: this.job.proposal,
+            review: this.job.review ?? review.defaultReviewState(),
+            bookmarks: this.bookmarks,
+            folderRoot: (id) => rootByFolder.get(id),
+            origins: this.job.origins,
+          })
+        : [];
+      await this.commit({
+        phase: 'done',
+        snapshotId: result.snapshot.id,
+        skipped,
+        emptiedFolders,
+        moveReport: buildMoveReport(live, result.snapshot),
+        heldBack,
+        ...counts,
+      }, token);
       return;
     }
 
@@ -536,6 +568,34 @@ export class Organizer {
     this.job = { ...this.job, done, total };
     this.emit();
     void this.persist(this.job);
+  }
+
+  private async generateDomain(token: number, settings: Settings, input: JobInput): Promise<void> {
+    const bookmarks = this.bookmarks;
+    const total = bookmarks.length;
+    const proposed = proposeByDomain({
+      bookmarks,
+      existingFolders: this.existingFolders,
+      minCount: input.domainMinCount ?? settings.domainMinCount,
+      keepThematic: input.keepThematic,
+    });
+    const proposal: Proposal = {
+      categories: proposed.categories,
+      assignments: proposed.assignments,
+      duplicates: proposed.duplicates,
+      warnings: proposed.warnings,
+    };
+    await this.commit(
+      {
+        phase: 'review',
+        proposal,
+        done: total,
+        total,
+        review: review.defaultDomainReviewState(),
+        error: undefined,
+      },
+      token,
+    );
   }
 
   private async generate(token: number, signal: AbortSignal, settings: Settings, input: JobInput): Promise<void> {

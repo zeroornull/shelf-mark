@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { ChatFn } from '../src/lib/ai/client';
-import { PROPOSE_SYSTEM, REFINE_SYSTEM } from '../src/lib/ai/prompts';
+import { proposeSystem, REFINE_SYSTEM } from '../src/lib/ai/prompts';
 import type { RawCategory } from '../src/lib/ai/schema';
 import {
   buildFolderRefs,
@@ -77,16 +77,20 @@ describe('finalizeTaxonomy – renumbering and parentId rewrite', () => {
 });
 
 describe('finalizeTaxonomy – seeds', () => {
-  it('appends missing seedCategories as top-level categories, skipping ones the model kept', () => {
-    const raw: RawCategory[] = [{ id: 'a', title: '工作' }, { id: 'b', title: '娱乐' }];
+  it('keeps checked topics and their children, drops other top-level categories and 「其他」', () => {
+    const raw: RawCategory[] = [
+      { id: 'a', title: '工作' },
+      { id: 'b', title: '笔记', parentId: 'a' },
+      { id: 'c', title: '娱乐' },
+      { id: 'd', title: '其他', parentId: 'a' },
+    ];
     const { categories } = finalizeTaxonomy(raw, ctx({ seedCategories: ['工作', '生活', ' 生活', '', '学习'] }));
-    expect(categories.map((c) => [c.id, c.title])).toEqual([
-      ['c1', '工作'],
-      ['c2', '娱乐'],
-      ['c3', '生活'],
-      ['c4', '学习'],
+    expect(categories.map((c) => [c.id, c.title, c.parentId])).toEqual([
+      ['c1', '工作', undefined],
+      ['c2', '笔记', 'c1'],
+      ['c5', '生活', undefined],
+      ['c6', '学习', undefined],
     ]);
-    expect(categories.every((c) => c.parentId === undefined)).toBe(true);
   });
 
   it('forces a seed the model nested under something else back to the top level', () => {
@@ -128,7 +132,7 @@ describe('finalizeTaxonomy – existing folders', () => {
   it('also auto-fills for backfilled seeds', () => {
     const raw: RawCategory[] = [{ id: 'a', title: 'A' }];
     const { categories } = finalizeTaxonomy(raw, ctx({ seedCategories: ['工作'] }));
-    expect(categories[1]).toEqual({ id: 'c2', title: '工作', existingFolderId: 'real-work' });
+    expect(categories).toEqual([{ id: 'c2', title: '工作', existingFolderId: 'real-work' }]);
   });
 });
 
@@ -236,7 +240,7 @@ describe('proposeTaxonomy / refineTaxonomy with an injected chat', () => {
       { chat },
     );
 
-    expect(seen[0]?.system).toBe(PROPOSE_SYSTEM);
+    expect(seen[0]?.system).toBe(proposeSystem(1));
     const payload = JSON.parse(seen[0]!.user) as Record<string, unknown>;
     expect(payload).toMatchObject({
       seedCategories: ['生活'],
@@ -257,14 +261,8 @@ describe('proposeTaxonomy / refineTaxonomy with an injected chat', () => {
     expect(seen[0]!.user).not.toContain('my@mail.com');
     expect(seen[0]!.user).toContain('[email]');
 
-    expect(result.categories).toEqual([
-      { id: 'c1', title: '前端', existingFolderId: 'real-fe' },
-      { id: 'c2', title: '购物' },
-      { id: 'c3', title: '开源', parentId: 'c1' },
-      { id: 'c4', title: '资讯' },
-      { id: 'c5', title: '生活' },
-    ]);
-    expect(result.leafCategories.map((c) => c.id)).toEqual(['c2', 'c3', 'c4', 'c5']);
+    expect(result.categories).toEqual([{ id: 'c5', title: '生活' }]);
+    expect(result.leafCategories.map((c) => c.id)).toEqual(['c5']);
   });
 
   it('refine sends existing categories and continues numbering', async () => {

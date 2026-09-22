@@ -20,6 +20,34 @@ export const REFINE_SYSTEM = `已有类目列表如下，但仍有一批书签�
 - 遵守 seedCategories 和 userHint
 - 只输出 JSON，shape 与生成类目时相同`;
 
+const SEEDED_PROPOSE_EXTRA = `
+用户勾选了顶层类目时再遵守：
+- 顶层只能使用 seedCategories 里的名称，不要新增别的顶层
+- 可以在这些顶层下补充二级类目（parentId 指向该顶层）
+- 对不上的不要新建「其他」，留给未分类`;
+
+const SEEDED_REFINE_EXTRA = `
+用户勾选了顶层类目时再遵守：
+- 只补充这些顶层下的二级类目，不要新增顶层
+- 不要新建「其他」`;
+
+/** 没勾选主题时用原文；勾选后追加「只能用这些顶层」的约束。 */
+export function proposeSystem(seedCount: number): string {
+  return seedCount > 0 ? PROPOSE_SYSTEM + SEEDED_PROPOSE_EXTRA : PROPOSE_SYSTEM;
+}
+
+export function refineSystem(seedCount: number): string {
+  return seedCount > 0 ? REFINE_SYSTEM + SEEDED_REFINE_EXTRA : REFINE_SYSTEM;
+}
+
+export function isProposeSystem(system: string): boolean {
+  return system === PROPOSE_SYSTEM || system.startsWith(`${PROPOSE_SYSTEM}\n`);
+}
+
+export function isRefineSystem(system: string): boolean {
+  return system === REFINE_SYSTEM || system.startsWith(`${REFINE_SYSTEM}\n`);
+}
+
 export const ASSIGN_SYSTEM = `你把书签分到已给定的类目中。
 规则：
 - 只依据 title 和 url

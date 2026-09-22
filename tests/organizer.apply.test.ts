@@ -100,6 +100,9 @@ describe('Organizer.apply – happy path', () => {
     const { job } = h.organizer.state;
     expect(job).toMatchObject({ phase: 'done', snapshotId: snapshot.id, done: 30, total: 30, backupFileName: 'backup-1.html', skipped: [] });
     expect(job.restore).toBeUndefined();
+    expect(job.moveReport).toHaveLength(30);
+    expect(job.moveReport?.some((row) => row.toPath.includes('购物'))).toBe(true);
+    expect(job.moveReport?.every((row) => row.fromPath.length > 0 && row.toPath.length > 0)).toBe(true);
 
     // 进度：applying 阶段 done 从 0 走到 30 并持久化；最后一条持久化是 done
     const progress = h.persisted.filter((j) => j?.phase === 'applying').map((j) => j!.done);

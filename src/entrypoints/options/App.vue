@@ -1,7 +1,7 @@
 <script lang="ts" setup>
 import { computed, ref } from 'vue';
 import ProviderForm from '@/components/ProviderForm.vue';
-import SeedCategoriesInput from '@/components/SeedCategoriesInput.vue';
+import ThemeSeedPicker from '@/components/ThemeSeedPicker.vue';
 import { useHostPermission } from '@/composables/useHostPermission';
 import { useSettings } from '@/composables/useSettings';
 import { describeAiError, pingProvider } from '@/lib/ai/client';
@@ -132,7 +132,7 @@ function setLanguage(value: string): void {
           <template v-else>授权状态未知</template>
         </span>
       </div>
-      <p v-if="!hasApiKey" class="text-xs text-amber-700">未配置 Key：整理功能不可用，先填 apiKey 并测试连接。</p>
+      <p v-if="!hasApiKey" class="text-xs text-amber-700">未配置 Key：按域名整理仍可用；AI 整理需要先填 apiKey 并测试连接。</p>
       <p v-if="permissionNote" class="rounded border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-800">{{ permissionNote }}</p>
       <p
         v-if="testResult"
@@ -206,7 +206,7 @@ function setLanguage(value: string): void {
           <span class="text-xs text-gray-500">生成类目 / 归类每次请求的上限，默认 180 秒</span>
         </div>
 
-        <label class="text-gray-600" for="debug-limit">debugLimit</label>
+        <label class="text-gray-600" for="debug-limit">调试条数</label>
         <div class="flex items-center gap-2">
           <input
             id="debug-limit"
@@ -216,7 +216,7 @@ function setLanguage(value: string): void {
             class="w-28 rounded border border-gray-300 px-2 py-1"
             placeholder="留空 = 全量"
           />
-          <span class="text-xs text-gray-500">只处理前 N 条，打通流程用；建议先用 20</span>
+          <span class="text-xs text-gray-500">只处理前 N 条，验收流程时建议先填 20，测完清空</span>
         </div>
 
         <span class="text-gray-600">隐私 / 安全</span>
@@ -236,9 +236,9 @@ function setLanguage(value: string): void {
     <section class="space-y-3">
       <h2 class="font-semibold">默认类目与偏好</h2>
       <div class="space-y-1">
-        <label class="text-gray-600">预填顶层类目（seedCategories）</label>
-        <SeedCategoriesInput v-model="settings.seedCategories" :disabled="!loaded" />
-        <p class="text-xs text-gray-500">整理页第 1 步还可以再改，也能从已有文件夹里勾选。</p>
+        <label class="text-gray-600">默认主题</label>
+        <ThemeSeedPicker v-model="settings.seedCategories" :disabled="!loaded" />
+        <p class="text-xs text-gray-500">整理页的 AI 卡片会带上这些勾选，也能再改。没勾选时，模型自己提出类目。</p>
       </div>
       <div class="space-y-1">
         <label class="text-gray-600" for="user-hint">一句话偏好（userHint）</label>

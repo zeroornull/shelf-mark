@@ -75,7 +75,7 @@ describe('Organizer – happy path', () => {
   });
 
   it('persists when seedCategories comes from a Vue-reactive Settings object', async () => {
-    const { organizer, persisted } = harness(4, { settings: reactive(settings()) });
+    const { organizer, persisted } = harness(4, { settings: reactive(settings({ seedCategories: ['生活'] })) });
     await organizer.start();
     await organizer.flush();
     expect(organizer.state.job.phase).toBe('review');
@@ -304,7 +304,7 @@ describe('Organizer – review edits and planned moves', () => {
     expect(api.calls.getTree).toBe(treeReads);
     const proposes = record.filter((r) => r.system === PROPOSE_SYSTEM);
     expect(proposes).toHaveLength(2);
-    expect(JSON.parse(proposes[1]!.user)).toMatchObject({ userHint: '不要按语言分', seedCategories: ['生活'] });
+    expect(JSON.parse(proposes[1]!.user)).toMatchObject({ userHint: '不要按语言分', seedCategories: [] });
     expect(organizer.state.job.input?.userHint).toBe('不要按语言分');
     expect(organizer.state.job.id).toBe('job-1');
     expect(organizer.state.job.review).toEqual({ excluded: [], includeUncategorized: false, includeDuplicates: false }); // 编辑被重置
@@ -394,5 +394,50 @@ describe('Organizer – payload leak check (§13)', () => {
     // 已有文件夹只以 f* + 路径出现
     const propose = JSON.parse(record.find((r) => r.system === PROPOSE_SYSTEM)!.user) as { existingFolders: unknown };
     expect(propose.existingFolders).toEqual([{ ref: 'f0', path: ['工作'] }]);
+  });
+});
+
+describe('Organizer – domain mode', () => {
+  it('starts without an api key, never calls chat, and reviews a domain proposal', async () => {
+    const record: Recorded[] = [];
+    const { organizer, api } = harness(4, {
+      settings: settings({ provider: { baseUrl: 'https://x', apiKey: '', model: 'm' } }),
+      record,
+    });
+    await organizer.start({ mode: 'domain' });
+    expect(organizer.state.job.phase).toBe('review');
+    expect(organizer.state.job.input?.mode).toBe('domain');
+    expect(record).toHaveLength(0);
+    expect(api.calls).toMatchObject({ create: 0, move: 0, remove: 0 });
+    const titles = organizer.state.job.proposal?.categories.map((c) => c.title) ?? [];
+    expect(titles).toEqual(expect.arrayContaining(['github.com', 'taobao.com', 'ycombinator.com']));
+    // miscN.example.org 被 tldts 收成同一个 example.org（4 条 ≥ 门槛）
+    expect(titles).toContain('example.org');
+    expect(titles.some((t) => t.startsWith('misc'))).toBe(false);
+    expect(organizer.state.job.review?.includeDuplicates).toBe(true);
+  });
+
+  it('keeps a bookmark that already sits in a GitHub folder as keep-still, then apply + undo', async () => {
+    const { organizer, api } = harness(0, { settings: settings({ autoBackup: false, includeFoldered: false }) });
+    await organizer.start({ mode: 'domain', includeFoldered: false });
+    expect(organizer.state.job.phase).toBe('review');
+    const before = api.dump();
+    await organizer.apply();
+    expect(organizer.state.job.phase).toBe('done');
+    const other = api.getNode('2');
+    const gh = (other?.children ?? []).find((c) => c.title === 'github.com');
+    expect(gh?.children?.some((c) => c.id === 'bm-gh-0')).toBe(true);
+    expect((other?.children ?? []).some((c) => c.id === 'bm-gh-0')).toBe(false);
+    await organizer.undo();
+    expect(api.dump()).toEqual(before);
+  });
+
+  it('does not start AI without a key, but domain mode still works on the same organizer', async () => {
+    const { organizer } = harness(4, { settings: settings({ provider: { baseUrl: 'https://x', apiKey: '', model: 'm' } }) });
+    await organizer.start();
+    expect(organizer.state.job.error).toContain('未配置 Key');
+    await organizer.reset();
+    await organizer.start({ mode: 'domain' });
+    expect(organizer.state.job.phase).toBe('review');
   });
 });

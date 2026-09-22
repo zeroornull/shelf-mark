@@ -17,8 +17,8 @@ const { settings, loaded: settingsLoaded, hasApiKey } = useSettings();
 const baseUrl = computed(() => settings.value.provider.baseUrl);
 const { origin, granted: originGranted } = useHostPermission(baseUrl);
 
-/** 未配 Key 时不能开始整理（§13 第一条）。 */
-const canOrganize = computed(() => settingsLoaded.value && hasApiKey.value);
+/** 按域名整理不需要 Key；AI 整理在整理页里再拦。 */
+const canOrganize = computed(() => settingsLoaded.value);
 
 /** 按当前整理范围统计各根：总数 / 散装 / 文件夹内。mobile 不进范围。 */
 const scopeStats = computed(() => {
@@ -61,7 +61,6 @@ function openOptions(): void {
           type="button"
           class="rounded bg-gray-900 px-2 py-1 text-xs text-white hover:bg-gray-700 disabled:cursor-not-allowed disabled:opacity-50"
           :disabled="!canOrganize"
-          :title="canOrganize ? '' : '先在设置里填 apiKey'"
           @click="openOrganize"
         >
           开始整理
@@ -75,7 +74,7 @@ function openOptions(): void {
       </template>
       <template v-else-if="!hasApiKey">
         <p class="flex items-center justify-between gap-2 text-amber-800">
-          <span>未配置 Key，无法开始整理。</span>
+          <span>未配置 Key：仍可按域名整理，AI 整理需要先填 Key。</span>
           <button type="button" class="underline hover:text-amber-950" @click="openOptions">去设置</button>
         </p>
       </template>

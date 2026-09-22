@@ -1,6 +1,6 @@
 # Shelfmark
 
-用 AI 预览并整理 Chrome 书签文件夹的浏览器扩展。读取你的书签树，让一个 OpenAI-compatible 模型提出类目、把范围内的书签（默认含已在文件夹里的）归类，你在预览里改到满意后再一键写回 Chrome 原生文件夹。写入前自动下载 HTML 备份，写入后可一键撤销；中途断掉也能回滚。原有文件夹变空后只提示，不会自动删除。
+先按域名、再用 AI，预览后写回 Chrome 原生文件夹的浏览器扩展。默认路径是按 eTLD+1 把够门槛的站点收进同名（或已有）文件夹，不调用模型；也可以让 OpenAI-compatible 模型提出类目再归类。范围内默认含已在文件夹里的书签。写入前自动下载 HTML 备份，写入后可一键撤销；中途断掉也能回滚。原有文件夹变空后只提示，不会自动删除。
 
 自用 / 小范围分享定位，以开发者模式加载，不上架。
 
@@ -8,9 +8,9 @@
 
 - Chrome 或 Edge **≥ 134**（依赖 `bookmarks` API 的 `folderType` / `syncing` 字段来识别书签栏、其他书签和账号 / 本地双树；低版本会拒绝安装）
 - Node.js ≥ 20 与 pnpm（仅构建时需要）
-- 一个 OpenAI-compatible 的接口：OpenAI、DeepSeek、OpenRouter、通义（兼容模式）、本地 Ollama / LM Studio 等
+- 按域名整理不需要 Key。AI 整理需要一个 OpenAI-compatible 接口：OpenAI、DeepSeek、OpenRouter、通义（兼容模式）、本地 Ollama / LM Studio 等
 
-## 本地安装
+## 本地安装（日常自己用）
 
 ```bash
 pnpm install
@@ -18,8 +18,6 @@ pnpm build          # 产物在 .output/chrome-mv3
 ```
 
 Chrome → `chrome://extensions` → 打开「开发者模式」→「加载已解压的扩展程序」→ 选择 `.output/chrome-mv3`。
-
-开发时可以用 `pnpm dev`，WXT 会启动一个带热更新的浏览器实例。
 
 点击扩展图标打开 side panel；side panel 里有「设置」和「开始整理」。
 
@@ -42,16 +40,17 @@ Chrome → `chrome://extensions` → 打开「开发者模式」→「加载已�
 - Ollama / LM Studio：`http://localhost/*` 已在可选权限列表里（任意端口）。Ollama 默认只监听 `127.0.0.1:11434`，用 `http://localhost:11434/v1` 或 `http://127.0.0.1:11434/v1` 都行；若浏览器报 403，把 Ollama 的 `OLLAMA_ORIGINS` 设为包含 `chrome-extension://*`。
 - 推理类模型拒绝 `temperature` / `max_tokens` / `response_format` 时会自动去掉该字段重试一次。
 
-其余设置：整理范围（「其他书签」，或加上书签栏）、是否包含已在文件夹中的书签（`includeFoldered`，默认开；关掉则只整理根下散装书签）、文件夹层数（1 或 2）、类目语言、每批条数、并发、请求超时（默认 180 秒，生成类目 / 归类每次请求的上限）、仅域名模式、是否自动备份、默认 `seedCategories` / `userHint`，以及打通流程用的 `debugLimit`（只处理前 N 条，建议先用 20 试跑）。
+其余设置：整理范围（「其他书签」，或加上书签栏）、是否包含已在文件夹里的书签（`includeFoldered`，默认开）、文件夹层数（1 或 2，仅 AI）、类目语言、每批条数、并发、请求超时（默认 180 秒，仅 AI 归类）、仅域名模式、是否自动备份、默认 `seedCategories` / `userHint`，以及打通流程用的 `debugLimit`（只处理前 N 条）。
 
 ## 整理流程
 
-整理在一个全屏页里分四步进行：
+整理在一个全屏页里分三步。第一步先选范围，再选两种方式之一：
 
-1. **范围确认**：显示将处理的书签数量（各根「共 N 条（散装 K，文件夹内 M）」）、域名分布；可开关「包含已在文件夹中的书签」；可预填顶层类目（也能从已有文件夹里勾选）和一句话偏好。
-2. **生成中**：模型先按域名分布提出类目（优先复用你已有的文件夹），再分批归类；未分类过多时补一轮类目。随时可取消，此阶段不写任何书签。
-3. **预览**：左侧类目、右侧书签。可以改某条的类目、合并 / 重命名类目、剔除某条、带新提示重新生成。「未分类」和「重复 URL」单独一栏，默认不移动，勾选后才动。
-4. **应用与结果**：确认后先自动下载 HTML 备份，然后串行移动书签（每移一条记一条日志）。完成后显示成功 / 跳过条数、备份文件名和「撤销」按钮。
+1. **选择方式**
+   - **按域名整理**（不需 Key）：每个能解析的网站各进一个文件夹，一条也建夹。`github.com` 也可对上已有的 `GitHub`。解析不了的链接不移动。已在主题文件夹里的默认不拆出。
+   - **AI 整理**（需要 Key）：按主题归类。可选一组主题（工作、阅读稍后、参考资料、购物、视频、社交、工具、个人），加上已有文件夹。默认都不勾。勾上的必须保留，模型只能在下面再分一层；没勾的不会出现，也不会建空文件夹。对不上的留在未分类。也可以不勾，让模型自己提出类目。
+2. **核对变化**：直接列出「从哪 → 到哪」。取消勾选就不会动。需要改某条分类时再展开编辑。域名路径几乎瞬间出方案；AI 路径生成时书签还不会动。
+3. **完成**：点确定后先自动下载 HTML 备份，再串行移动。完成后可以撤销。
 
 写入规则：优先复用同名文件夹（忽略大小写、全半角、首尾空白），新文件夹追加到末尾，书签栏和「其他书签」各归各根、不跨根移动，「书签栏 / 其他书签 / 移动书签」根节点本身不改。企业策略书签不进整理范围。已经在目标文件夹里的书签保持不动。原有用户文件夹即使被搬空也绝不自动删除（结果页会列出可手动删除的空文件夹）；只有本次新建且事后为空的文件夹，撤销 / 回滚时才会 `remove`。
 
@@ -85,14 +84,31 @@ Chrome → `chrome://extensions` → 打开「开发者模式」→「加载已�
 
 账号 / 后端、抓网页正文、失效链接扫描、静默自动移动、语义向量搜索、Firefox 优先适配、改动根节点、勾选任意文件夹作为范围、中断后「继续执行」、上架相关内容（商店文案、多语言、权限警告优化）。
 
-## 开发
+## 开发（WSL 里不要每次 build）
+
+WXT 在 WSL 里**不会**自动打开 Chrome，终端里那条 `Cannot open browser when using WSL` 可以忽略。`pnpm dev` 仍会把热更新产物写到 `.output/chrome-mv3-dev`。
 
 ```bash
-pnpm test        # vitest：书签层 / AI 层 / 状态机 / 备份 / 文案
+pnpm dev         # 保持运行；启动时会打印 Windows 加载路径并复制到剪贴板
+pnpm ext:open    # 用资源管理器打开 chrome-mv3-dev
+pnpm test:watch  # 分类 / 移动 / 撤销逻辑在 Node 里跑，不用开浏览器
+pnpm test        # 单次跑完测试
 pnpm compile     # vue-tsc --noEmit
-pnpm build       # 产出 .output/chrome-mv3
-pnpm dev         # 带热更新的开发模式
+pnpm build       # 只在要装「日常用」的 chrome-mv3 时才需要
 ```
+
+第一次（或换了目录之后）：
+
+1. 保持 `pnpm dev` 运行。
+2. Windows Chrome 打开 `chrome://extensions` → 开发者模式 → **加载已解压的扩展程序**。
+3. 选 `.output/chrome-mv3-dev`。WSL 路径形如  
+   `\\wsl.localhost\<发行版>\home\…\shelfmark\.output\chrome-mv3-dev`  
+   （`pnpm dev` / `pnpm ext:path` 会打印并复制）。**不要**再加载 `chrome-mv3`。
+4. 之后改整理页 / 设置 / side panel 的 Vue 和 CSS，保存即可热更新，不用再 build，也不用重新加载扩展。
+5. 改了 background / `wxt.config` / manifest 权限时，到 `chrome://extensions` 点一下该扩展的刷新。
+6. 验收流程先在设置里把「调试条数」设成 20。
+
+Chrome 137 曾无法从 `\\wsl.localhost\…` 加载解压扩展，138 已修。本扩展本身要求 Chrome ≥ 134；若加载失败，把 Chrome 升到 138+，或把仓库放到 `/mnt/c/…` 再 `pnpm dev`。
 
 约定：`src/lib/**` 里只有 `bookmarks/api.ts`、`settings.ts`、`jobs/store.ts` 允许 import `wxt/*` / `browser`；其余模块通过参数接收 `BookmarksApi`、持久化函数和 `fetch`，因此测试在 Node 里直接跑，书签写入用内存实现的 `fake.ts` 复刻 Chrome 的 index 语义。
 

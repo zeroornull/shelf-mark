@@ -1,5 +1,5 @@
 import type { ChatFn } from '../../src/lib/ai/client';
-import { ASSIGN_SYSTEM, PROPOSE_SYSTEM, REFINE_SYSTEM } from '../../src/lib/ai/prompts';
+import { ASSIGN_SYSTEM, isProposeSystem, isRefineSystem } from '../../src/lib/ai/prompts';
 import type { BookmarksApi, BookmarkTreeNode } from '../../src/lib/bookmarks/api';
 import { createFakeBookmarksApi, type FakeBookmarksApi, type SeedNode } from '../../src/lib/bookmarks/fake';
 import { Organizer, type OrganizerDeps } from '../../src/lib/jobs/organizer';
@@ -16,6 +16,7 @@ export const settings = (overrides: Partial<Settings> = {}): Settings => ({
   provider: { baseUrl: 'https://api.example.com/v1', apiKey: API_KEY, model: 'm' },
   scope: 'loose-other',
   includeFoldered: false,
+  domainMinCount: 3,
   maxDepth: 2,
   batchSize: 10,
   concurrency: 2,
@@ -23,7 +24,7 @@ export const settings = (overrides: Partial<Settings> = {}): Settings => ({
   language: 'zh',
   domainOnly: false,
   autoBackup: true,
-  seedCategories: ['生活'],
+  seedCategories: [],
   userHint: '',
   ...overrides,
 });
@@ -60,7 +61,7 @@ export function scriptedChat(
 ): ChatFn {
   return (async (args: { system: string; user: string; signal?: AbortSignal }) => {
     record.push({ system: args.system, user: args.user });
-    if (args.system === PROPOSE_SYSTEM) {
+    if (isProposeSystem(args.system)) {
       if (hooks.failPropose !== undefined) throw hooks.failPropose;
       return {
         categories: [
@@ -71,7 +72,7 @@ export function scriptedChat(
         ],
       };
     }
-    if (args.system === REFINE_SYSTEM) {
+    if (isRefineSystem(args.system)) {
       return { categories: [{ id: 'r', title: '工具' }] };
     }
     if (args.system === ASSIGN_SYSTEM) {

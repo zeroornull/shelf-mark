@@ -8,12 +8,12 @@ const emit = defineEmits<{ cancel: [] }>();
 
 const LABELS: Record<JobPhase, string> = {
   idle: '空闲',
-  'loading-tree': '读取书签树…',
-  proposing: '生成类目…',
-  assigning: '批量归类',
-  refining: '补充类目并重新归类',
-  review: '预览',
-  applying: '应用中',
+  'loading-tree': '正在读你的书签…',
+  proposing: '正在想分类…',
+  assigning: '正在归类',
+  refining: '有些分不准，正在补类目',
+  review: '请核对变化',
+  applying: '正在移动书签…',
   done: '完成',
   error: '出错',
 };

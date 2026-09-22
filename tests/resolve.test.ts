@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { resolveMoves } from '../src/lib/jobs/resolve';
+import { isKeepStillMove, listApplyCandidates, resolveMoves } from '../src/lib/jobs/resolve';
 import type { Proposal, ReviewState } from '../src/lib/types';
 
 /**
@@ -86,5 +86,69 @@ describe('resolveMoves', () => {
       origins: { 'o-fe': { parentId: 'old-parent' } },
     });
     expect(fromOrigin[0]).toMatchObject({ bookmarkId: 'o-fe', expectedParentId: 'old-parent' });
+  });
+
+  it('treats a path move as keep-still when folderPath already matches toPath', () => {
+    expect(
+      isKeepStillMove(
+        { bookmarkId: 'a', toPath: ['github.com'], expectedParentId: '2' },
+        { parentId: 'gh', folderPath: ['github.com'] },
+      ),
+    ).toBe(true);
+    expect(
+      isKeepStillMove(
+        { bookmarkId: 'a', toPath: ['github.com'], expectedParentId: '2' },
+        { parentId: '2', folderPath: [] },
+      ),
+    ).toBe(false);
+    expect(isKeepStillMove({ bookmarkId: 'a', toParentId: 'gh', expectedParentId: 'gh' })).toBe(true);
+  });
+
+  it('lists apply candidates including excluded rows so the user can uncheck part of a plan', () => {
+    const rows = listApplyCandidates({
+      proposal: {
+        categories: [{ id: 'c1', title: 'github.com' }, { id: 'c2', title: '其他站点' }],
+        assignments: [
+          { bookmarkId: 'a', categoryId: 'c1', confidence: 'high' },
+          { bookmarkId: 'b', categoryId: 'c2', confidence: 'medium' },
+          { bookmarkId: 'c', categoryId: 'uncategorized', confidence: 'low' },
+        ],
+        duplicates: [],
+        warnings: { unknownCategory: 0, missingIndex: 0 },
+      },
+      review: { excluded: ['b'], includeUncategorized: false, includeDuplicates: true },
+      bookmarks: [
+        { id: 'a', title: 'Repo', rootId: '2', parentId: '2', folderPath: [] },
+        { id: 'b', title: 'Rare', rootId: '2', parentId: '2', folderPath: [] },
+        { id: 'c', title: 'Skip', rootId: '2', parentId: '2', folderPath: [] },
+      ],
+      folderRoot: () => undefined,
+      rootTitleOf: () => '其他书签',
+    });
+    expect(rows.map((r) => r.bookmarkId)).toEqual(['a', 'b']);
+    expect(rows.find((r) => r.bookmarkId === 'a')).toMatchObject({
+      destLabel: '其他书签 / github.com',
+      fromLabel: '其他书签',
+      excluded: false,
+      keepStill: false,
+    });
+    expect(rows.find((r) => r.bookmarkId === 'b')).toMatchObject({ destLabel: '其他书签 / 其他站点', excluded: true });
+    expect(resolveMoves({
+      proposal: {
+        categories: [{ id: 'c1', title: 'github.com' }, { id: 'c2', title: '其他站点' }],
+        assignments: [
+          { bookmarkId: 'a', categoryId: 'c1', confidence: 'high' },
+          { bookmarkId: 'b', categoryId: 'c2', confidence: 'medium' },
+        ],
+        duplicates: [],
+        warnings: { unknownCategory: 0, missingIndex: 0 },
+      },
+      review: { excluded: ['b'], includeUncategorized: false, includeDuplicates: true },
+      bookmarks: [
+        { id: 'a', rootId: '2', parentId: '2' },
+        { id: 'b', rootId: '2', parentId: '2' },
+      ],
+      folderRoot: () => undefined,
+    })).toEqual([{ bookmarkId: 'a', toPath: ['github.com'], expectedParentId: '2' }]);
   });
 });

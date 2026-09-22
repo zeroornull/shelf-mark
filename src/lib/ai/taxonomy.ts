@@ -2,10 +2,10 @@ import { normalizeTitle } from '../bookmarks/mutate';
 import type { Category, FlatBookmark } from '../types';
 import type { ChatFn } from './client';
 import {
-  PROPOSE_SYSTEM,
-  REFINE_SYSTEM,
   buildProposeUser,
   buildRefineUser,
+  proposeSystem,
+  refineSystem,
   type ExistingFolderRef,
   type PromptLanguage,
 } from './prompts';
@@ -75,7 +75,8 @@ export async function proposeTaxonomy(input: ProposeInput, deps: TaxonomyDeps): 
     maxDepth: input.maxDepth,
     language: input.language,
   });
-  const raw = await deps.chat({ system: PROPOSE_SYSTEM, user, schema: taxonomySchema, signal: input.signal });
+  const seeds = cleanSeeds(input.seedCategories);
+  const raw = await deps.chat({ system: proposeSystem(seeds.length), user, schema: taxonomySchema, signal: input.signal });
   console.debug('[shelfmark] propose returned', raw.categories.length, 'categories');
   return finalizeTaxonomy(raw.categories, {
     existing: [],
@@ -98,7 +99,8 @@ export async function refineTaxonomy(input: RefineInput, deps: TaxonomyDeps): Pr
     maxDepth: input.maxDepth,
     language: input.language,
   });
-  const raw = await deps.chat({ system: REFINE_SYSTEM, user, schema: refineSchema, signal: input.signal });
+  const seeds = cleanSeeds(input.seedCategories);
+  const raw = await deps.chat({ system: refineSystem(seeds.length), user, schema: refineSchema, signal: input.signal });
   console.debug('[shelfmark] refine returned', raw.categories.length, 'categories');
   return finalizeTaxonomy(raw.categories, {
     existing: input.categories,
@@ -205,11 +207,34 @@ export function finalizeTaxonomy(raw: RawCategory[], ctx: FinalizeContext): Taxo
     else if (top !== category.parentId) category.parentId = top;
   }
 
-  // 6：叶子
-  const parents = new Set(all.map((c) => c.parentId).filter((id): id is string => id !== undefined));
-  const leafCategories = all.filter((c) => !parents.has(c.id));
+  // 6：勾选了主题时，只留这些顶层及其二级；模型另起的顶层和「其他」丢掉
+  const anchored = retainAnchoredCategories(all, ctx.seedCategories);
+  const anchoredIds = new Set(anchored.map((c) => c.id));
+  const keptAdded = added.filter((c) => anchoredIds.has(c.id));
 
-  return { categories: all, added, leafCategories };
+  // 7：叶子
+  const parents = new Set(anchored.map((c) => c.parentId).filter((id): id is string => id !== undefined));
+  const leafCategories = anchored.filter((c) => !parents.has(c.id));
+
+  return { categories: anchored, added: keptAdded, leafCategories };
+}
+
+const CATCH_ALL_TITLES = new Set(['其他', '其它', '未分类'].map((title) => normalizeTitle(title)));
+
+/** 有种子时只保留种子顶层，以及直接挂在它们下面、且不是「其他」的二级。无种子时原样返回。 */
+export function retainAnchoredCategories(categories: Category[], seeds: ReadonlyArray<string>): Category[] {
+  const seedKeys = new Set(cleanSeeds(seeds).map((seed) => normalizeTitle(seed)));
+  if (seedKeys.size === 0) return categories;
+  const keep = new Set<string>();
+  for (const category of categories) {
+    if (seedKeys.has(normalizeTitle(category.title))) keep.add(category.id);
+  }
+  for (const category of categories) {
+    if (keep.has(category.id) || category.parentId === undefined || !keep.has(category.parentId)) continue;
+    if (CATCH_ALL_TITLES.has(normalizeTitle(category.title))) continue;
+    keep.add(category.id);
+  }
+  return categories.filter((category) => keep.has(category.id));
 }
 
 /** 类目在文件夹树里的路径：`[父类目标题?, 自身标题]`。 */

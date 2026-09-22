@@ -297,6 +297,23 @@ export function listEmptiedUserFolders(
   return out;
 }
 
+/** 文件夹 id → 含根标题的显示路径，给应用后的「从哪到哪」报告用。 */
+export function folderDisplayPaths(tree: BookmarkTree): Map<string, string[]> {
+  const out = new Map<string, string[]>();
+  for (const root of tree.roots) {
+    const rootLabel = root.title.trim() || root.folderType;
+    out.set(root.id, [rootLabel]);
+    for (const folder of listReusableFolders(tree, root.id)) {
+      out.set(folder.id, [rootLabel, ...folder.path]);
+    }
+  }
+  return out;
+}
+
+export function formatFolderPath(path: readonly string[]): string {
+  return path.length > 0 ? path.join(' / ') : '（根）';
+}
+
 function indexFolders(tree: BookmarkTree): Map<string, { node: FolderNode; path: string[] }> {
   const out = new Map<string, { node: FolderNode; path: string[] }>();
   const walk = (folder: FolderNode, path: string[]) => {

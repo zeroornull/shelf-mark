@@ -1,4 +1,5 @@
 import { computed, onScopeDispose, ref, toRaw, watch } from 'vue';
+import { clampDomainMinCount } from '@/lib/domain-sort';
 import { toPlain } from '@/lib/plain';
 import { clampRequestTimeoutMs } from '@/lib/request-timeout';
 import { persistSettings, settingsStorage } from '@/lib/settings';
@@ -22,6 +23,7 @@ export function useSettings(options: { debounceMs?: number } = {}) {
   function applyRemote(value: Settings | null): void {
     const next = value ?? structuredClone(settingsStorage.fallback);
     if (next.includeFoldered === undefined) next.includeFoldered = true;
+    next.domainMinCount = clampDomainMinCount(next.domainMinCount);
     next.requestTimeoutMs = clampRequestTimeoutMs(next.requestTimeoutMs);
     const json = JSON.stringify(next);
     if (json === lastSynced) return;

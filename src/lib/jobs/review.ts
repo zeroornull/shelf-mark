@@ -10,6 +10,11 @@ export function defaultReviewState(): ReviewState {
   return { excluded: [], includeUncategorized: false, includeDuplicates: false };
 }
 
+/** 按域名整理：重复 URL 也按域名归夹；未分类仍默认不移动（主题夹 / 解析失败）。 */
+export function defaultDomainReviewState(): ReviewState {
+  return { excluded: [], includeUncategorized: false, includeDuplicates: true };
+}
+
 /** 改某条书签的类目（`c*` 或 `uncategorized`）；未知类目 id、或目标是有子类目的父类目（纯结构）时原样返回。 */
 export function setAssignmentCategory(proposal: Proposal, bookmarkId: string, categoryId: string): Proposal {
   if (categoryId !== UNCATEGORIZED && !proposal.categories.some((c) => c.id === categoryId)) return proposal;
